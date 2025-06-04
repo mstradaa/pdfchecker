@@ -1,6 +1,6 @@
 # PDF Checker
 
-![pdfCheckerlogo](https://github.com/user-attachments/assets/a98cd689-1eee-4c41-9846-d3727fc26bfd)
+![pdfc_logo](https://github.com/user-attachments/assets/9b3d7f17-e3b1-4238-92dc-7231323eede6)
 
 ## Overview
 
