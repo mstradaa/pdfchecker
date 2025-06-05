@@ -8,7 +8,7 @@
 
 You can find the tool chart [here](https://github.com/Strateo/pdfchecker/blob/main/docs/Mermaid_architecture.png) and a sample of the generated report [here](https://github.com/Strateo/pdfchecker/blob/main/docs/Report_sample.pdf).
 
-## 🧾 Features
+## Features
 
 ### 1. Hash Calculation and Verification
 - **MD5, SHA-1, and SHA-256 Hashes**: Calculates cryptographic hashes for PDF files to ensure data integrity and verify authenticity.
@@ -32,9 +32,9 @@ You can find the tool chart [here](https://github.com/Strateo/pdfchecker/blob/ma
 
 
 
-## 🛠️ Installation & Usage
+## Installation & Usage
 
-## Installation
+### Installation
 
 Ensure you have Python 3.8 or higher installed along with the required dependencies listed in `pyproject.toml`.
 
@@ -66,19 +66,18 @@ The tool provides a command-line interface with the following options:
 
 
 
-## 🔐 Security Considerations
+## Security Considerations
 
 ### Input & Content Validation
 - File type, path, and size validation (100MB limit).
 - JavaScript preview and metadata extraction length limits to prevent overloads.
 - Controlled API input with retry safeguards.
-- Compatible with Windows, macOS, and Linux.
 
 ### Secure API Handling
 - API communication is HTTPS-only with strict timeout enforcement.
 - Duplicate Call Prevention: Identical links within the same document are scanned only once to minimize redundant VirusTotal API usage (URLs with different paths or subdomains are treated as distinct and checked separately).
 - API key memory cleaning to avoid memory dumps or swap files. 
-- API keys are encrypted and stored using OS-native keychain utilities (Keychain, Credential manager, Gnome Keyring, KWallet, FSS).
+- API keys are encrypted and stored using OS-native keychain utilities (Keychain, Credential manager, Gnome Keyring, KWallet).
 
 ### Forensic Features
 - Dual-hash integrity: report includes original PDF hash and generated report hash.
