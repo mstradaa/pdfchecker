@@ -2,38 +2,12 @@ import hashlib
 import os
 import requests
 from core.config_manager import get_api_key
+from core.utils import get_confirmation
 
 
 REQUEST_TIMEOUT = 30
 CHUNK_SIZE = 8192
-MAX_INPUT_LENGTH = 1000
 
-def _secure_clear_variable(var):
-    if var is not None:
-        try:
-            del var
-        except:
-            pass
-
-def get_confirmation(prompt: str) -> bool:
-    full_prompt = f"{prompt} (Y/N, Q to quit): "
-    while True:
-        try:
-            response = input(full_prompt).strip().upper()
-            
-            if len(response) > MAX_INPUT_LENGTH:
-                print("Error: Input too long. Please try again.")
-                continue
-                
-            if response == 'Q':
-                print("Operation cancelled by user.")
-                return False
-            if response in ('Y', 'N'):
-                return response == 'Y'
-            print("Please enter Y, N, or Q.")
-        except (EOFError, KeyboardInterrupt):
-            print("\nOperation cancelled.")
-            return False
 
 def calculate_file_hashes(file_path):
     if not os.path.exists(file_path):
@@ -134,7 +108,7 @@ def main(file_path, silent=False, validate_pdf_file=None):
             
             result = check_virustotal(hashes['SHA-256'], silent)
             if result and not silent:
-                stats = result.get("data", {}).get("attributes", {}).get("stats", {})
+                stats = result.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
                 _print_virustotal_results(stats)
             elif not result and not silent:
                 print("VirusTotal check failed. Please check your API key or try again later.")

@@ -3,34 +3,11 @@ import requests
 import os
 from typing import List, Dict, Optional, Tuple, Set
 from .config_manager import get_api_key, get_api_limit
+from .utils import get_confirmation
 
 REQUEST_TIMEOUT = 30
 
-def _secure_clear_variable(var):
-    if var is not None:
-        try:
-            del var
-        except:
-            pass
 
-def get_confirmation(prompt: str) -> bool:
-    while True:
-        try:
-            response = input(f"{prompt} (Y/N, Q to quit): ").strip().upper()
-            
-            if len(response) > 1000:
-                print("Error: Input too long. Please try again.")
-                continue
-                
-            if response == 'Q':
-                print("Operation cancelled by user.")
-                return False
-            if response in ['Y', 'N']:
-                return response == 'Y'
-            print("Please enter Y, N, or Q.")
-        except (EOFError, KeyboardInterrupt):
-            print("\nOperation cancelled.")
-            return False
 
 class LinkExtractor:
     def __init__(self):
@@ -140,7 +117,6 @@ class LinkExtractor:
         self.checked_urls.clear()
         self.api_calls_made = 0
 
-        _secure_clear_variable(self.api_key)
         self.api_key = None
         self._api_initialized = False
 

@@ -7,6 +7,7 @@ from .link_extractor import extract_links, check_link_virustotal, defang_url
 from .metadata_analyzer import analyze_pdf_metadata
 from .javascript_detector import extract_javascript_from_pdf
 from .config_manager import get_api_key, get_api_limit
+from .utils import get_confirmation
 
 PDFCHECKER_VERSION = "1.0"
 PAGE_HEIGHT = 842
@@ -21,24 +22,7 @@ CHAR_REPLACEMENTS = str.maketrans({
     '\x0e': '', '\x0f': '', '\u2019': "'", '\u201c': '"', '\u201d': '"', '\u2013': '-', '\u2014': '-'
 })
 
-def get_confirmation(prompt: str) -> bool:
-    while True:
-        try:
-            response = input(f"{prompt} (Y/N, Q to quit): ").strip().upper()
-            
-            if len(response) > 1000:
-                print("Error: Input too long. Please try again.")
-                continue
-                
-            if response == 'Q':
-                print("Operation cancelled by user.")
-                return False
-            if response in ('Y', 'N'):
-                return response == 'Y'
-            print("Please enter Y, N, or Q.")
-        except (EOFError, KeyboardInterrupt):
-            print("\nOperation cancelled.")
-            return False
+
 
 def check_page_break(y, page, doc, margin=PAGE_MARGIN, page_height=PAGE_HEIGHT):
     if y > (page_height - margin):
@@ -336,23 +320,25 @@ def format_virustotal_file_result(vt_report):
     if not vt_report:
         return "File not found in VirusTotal database. No previous analysis available."
     
-    positives = vt_report.get('positives', 0)
-    total = vt_report.get('total', 0)
+    attrs = vt_report.get("data", {}).get("attributes", {})
+    stats = attrs.get("last_analysis_stats", {})
+    total = sum(stats.values())
     
     if total == 0:
         return "File not found in VirusTotal database. No previous analysis available."
     
+    positives = stats.get("malicious", 0) + stats.get("suspicious", 0)
     result = f"Detection Rate: {positives}/{total} ({positives/total*100:.1f}%)"
     if positives > 0:
         result += "\nDetections:"
-        for scanner, scan_result in vt_report.get('scans', {}).items():
-            if scan_result.get('detected'):
+        for scanner, scan_result in attrs.get("last_analysis_results", {}).items():
+            if scan_result.get("category") in ("malicious", "suspicious"):
                 result += f"\n- {scanner}: {scan_result.get('result', 'Unknown')}"
     
-    scan_date = vt_report.get('scan_date')
-    if scan_date:
+    last_scan_date = attrs.get("last_analysis_date")
+    if last_scan_date:
         try:
-            scan_datetime = datetime.fromtimestamp(scan_date, tz=timezone.utc)
+            scan_datetime = datetime.fromtimestamp(last_scan_date, tz=timezone.utc)
             result += f"\nScan Date: {scan_datetime.strftime('%Y-%m-%d %H:%M:%S')} UTC"
         except (ValueError, TypeError):
             pass
@@ -391,7 +377,7 @@ def main(pdf_path, validate_pdf_file=None):
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return
         
-    operator_name = input("\nPlease type your name (enter to skip): ").strip()
+    operator_name = input("\nPlease type your name (enter to skip): ").strip()[:MAX_OPERATOR_NAME_LENGTH]
     
     success, api_key = get_api_key()
     check_vt = False

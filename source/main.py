@@ -8,6 +8,7 @@ from core.link_extractor import main as link_extractor_main
 from core.metadata_analyzer import analyze_pdf_metadata, print_metadata
 from core.javascript_detector import extract_javascript_from_pdf, print_javascript_findings
 from core.report_generator import main as report_generator_main
+from core.utils import get_confirmation
 
 MAX_FILE_SIZE_MB = 100
 MAX_INPUT_LENGTH = 1000
@@ -47,24 +48,7 @@ def get_user_input(prompt: str, max_length: int = MAX_INPUT_LENGTH) -> str:
     except (EOFError, KeyboardInterrupt):
         raise KeyboardInterrupt("Operation cancelled")
 
-# yes / no / quit prompt for user input
-def get_confirmation(prompt: str) -> bool:
-    while True:
-        try:
-            response = get_user_input(f"{prompt} (Y/N, Q to quit): ").upper()
-            
-            if response == 'Q':
-                print(" ")
-                return False
-            if response in ('Y', 'N'):
-                return response == 'Y'
-            print("Please enter Y, N, or Q.")
-            
-        except ValueError:
-            print("Error: Input too long. Please try again.")
-        except KeyboardInterrupt:
-            print("\nOperation cancelled.")
-            return False
+
 
 def handle_config_error(operation_name: str, error: Exception):
     if isinstance(error, (ConfigError, KeyringError)):

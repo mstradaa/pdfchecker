@@ -1,6 +1,6 @@
 # Manage VirusTotal API key and related settings using the system keyring.
 import sys
-import gc
+
 import re
 from typing import Tuple, Optional
 import keyring
@@ -23,16 +23,7 @@ class ConfigError(Exception):
 class KeyringError(ConfigError):
     pass
 
-# remove sensitive data from memory
-def _secure_clear_string(string_var: Optional[str]) -> None:
-    if string_var is None:
-        return
-    try:
-        if hasattr(string_var, '__del__'):
-            del string_var
-        gc.collect()
-    except Exception:
-        pass
+
 
 def _get_platform_specific_error_message() -> str:
     global _platform_message
@@ -75,24 +66,17 @@ def _verify_secure_backend() -> bool:
 def _validate_api_key(api_key: str) -> bool:
     return bool(api_key and len(api_key) == API_KEY_LENGTH and API_KEY_PATTERN.match(api_key))
 
-class _SecureApiKeyManager:
-    def __init__(self, api_key: Optional[str]):
-        self.api_key = api_key
-    def __enter__(self):
-        return self.api_key
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        _secure_clear_string(self.api_key)
+
 
 # get API key from keyring
 def get_api_key() -> Tuple[bool, str]:
     if not _verify_secure_backend():
         raise KeyringError("No secure keyring backend available")
     try:
-        with _SecureApiKeyManager(keyring.get_password(SERVICE_NAME, ACCOUNT_NAME)) as api_key:
-            if not api_key:
-                return False, "No API key is currently set."
-            return True, api_key
-        
+        api_key = keyring.get_password(SERVICE_NAME, ACCOUNT_NAME)
+        if not api_key:
+            return False, "No API key is currently set."
+        return True, api_key
     except keyring.errors.KeyringError as e:
         error_msg = f"Error accessing system keyring: {str(e)}\n{_get_platform_specific_error_message()}"
         raise KeyringError(error_msg)
@@ -105,17 +89,14 @@ def set_api_key_secure(api_key: str) -> Tuple[bool, str]:
         return False, "No secure keyring backend available"
         
     if not api_key or not isinstance(api_key, str):
-        _secure_clear_string(api_key)
         return False, "Invalid API key format"
     
     if not _validate_api_key(api_key):
-        _secure_clear_string(api_key)
         return False, "Invalid VirusTotal API key format. Expected 64 hexadecimal characters."
     
     try:
-        with _SecureApiKeyManager(api_key):
-            keyring.set_password(SERVICE_NAME, ACCOUNT_NAME, api_key)
-            return True, "VirusTotal API key is now securely stored."
+        keyring.set_password(SERVICE_NAME, ACCOUNT_NAME, api_key)
+        return True, "VirusTotal API key is now securely stored."
             
     except keyring.errors.KeyringError as e:
         error_msg = f"Error accessing system keyring: {str(e)}\n{_get_platform_specific_error_message()}"
@@ -143,8 +124,7 @@ def remove_api_key() -> Tuple[bool, str]:
     except Exception as e:
         error_msg = f"Unexpected error removing API key: {str(e)}"
         return False, error_msg
-    finally:
-        _secure_clear_string(existing_key)
+
 
 def get_api_limit() -> Tuple[bool, int]:
     if not _verify_secure_backend():

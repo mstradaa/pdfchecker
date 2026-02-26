@@ -1,13 +1,13 @@
 import os
 import fitz
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 import re
 
 MAX_METADATA_SIZE = 10000
 MAX_STRING_LENGTH = 1000
 
-logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 PDF_VERSION_PATTERN = re.compile(r'PDF-[\d.]+', re.IGNORECASE)
@@ -47,7 +47,19 @@ def _parse_pdf_date(date_str):
         minute = int(date_str[10:12])
         second = int(date_str[12:14])
         
-        return f"{datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)} UTC"
+        # Parse timezone offset if present (e.g. +05'30', -04'00', Z)
+        tz_info = timezone.utc
+        tz_suffix = date_str[14:].strip("'")
+        if tz_suffix and tz_suffix != 'Z':
+            tz_match = re.match(r"([+-])(\d{2})'?(\d{2})?'?", tz_suffix)
+            if tz_match:
+                sign = 1 if tz_match.group(1) == '+' else -1
+                tz_hours = int(tz_match.group(2))
+                tz_minutes = int(tz_match.group(3)) if tz_match.group(3) else 0
+                tz_info = timezone(timedelta(hours=sign * tz_hours, minutes=sign * tz_minutes))
+        
+        dt = datetime(year, month, day, hour, minute, second, tzinfo=tz_info)
+        return str(dt)
     except (ValueError, IndexError) as e:
         logger.debug(f"Failed to parse date '{date_str}': {str(e)}")
         return None
@@ -121,10 +133,13 @@ def get_human_readable_pdf_permissions(perms):
     if perms is None:
         return "Not available"
     permission_map = [
-        (0x0004, "Print"),
-        (0x0008, "Modify"), 
-        (0x0010, "Copy"),
-        (0x0020, "Annotate")
+        (fitz.PDF_PERM_PRINT, "Print"),
+        (fitz.PDF_PERM_MODIFY, "Modify"),
+        (fitz.PDF_PERM_COPY, "Copy"),
+        (fitz.PDF_PERM_ANNOTATE, "Annotate"),
+        (fitz.PDF_PERM_FORM, "Fill Forms"),
+        (fitz.PDF_PERM_ASSEMBLE, "Assemble"),
+        (fitz.PDF_PERM_PRINT_HQ, "Print High Quality")
     ]
     
     permissions = [name for flag, name in permission_map if perms & flag]
@@ -136,9 +151,16 @@ def get_file_system_attributes(file_path, file_stats_param=None):
         if stats_to_use is None:
             stats_to_use = os.stat(file_path)
         
+        # Use st_birthtime on macOS/FreeBSD for actual creation time;
+        # st_ctime is metadata change time on Unix, not creation time
+        if hasattr(stats_to_use, 'st_birthtime'):
+            created_ts = stats_to_use.st_birthtime
+        else:
+            created_ts = stats_to_use.st_ctime
+        
         return {
             "size": f"{stats_to_use.st_size} bytes",
-            "created": f"{datetime.fromtimestamp(stats_to_use.st_ctime, tz=timezone.utc)} UTC",
+            "created": f"{datetime.fromtimestamp(created_ts, tz=timezone.utc)} UTC",
             "last_modified": f"{datetime.fromtimestamp(stats_to_use.st_mtime, tz=timezone.utc)} UTC",
             "last_accessed": f"{datetime.fromtimestamp(stats_to_use.st_atime, tz=timezone.utc)} UTC",
             "permissions_octal": oct(stats_to_use.st_mode)[-3:],
@@ -189,7 +211,7 @@ def _analyze_pages_combined(doc):
                 page_analysis["has_javascript"]):
                 break
                 
-            for annot in page.annots():
+            for annot in (page.annots() or []):
                 annot_type = annot.type
                 if not page_analysis["has_form_fields"] and annot_type[1] == "Widget":
                     page_analysis["has_form_fields"] = True
@@ -218,7 +240,10 @@ def _get_document_id(doc):
                 if 'ID' in trailer_keys:
                     id_type, id_value = doc.xref_get_key(-1, 'ID')
                     if id_value:
-                        return id_value
+                        hex_parts = re.findall(r'<([0-9a-fA-F]+)>', id_value)
+                        if hex_parts:
+                            return hex_parts[0].upper()
+                        return id_value  
             except Exception as e:
                 logger.debug(f"Error getting trailer ID: {str(e)}")
         
@@ -327,9 +352,8 @@ def analyze_pdf_metadata(pdf_path, validate_pdf_file=None, file_stats=None):
             
             if is_encrypted:
                 result["security_info"] = {
-                    "encryption_method": safe_get_attr(doc, "get_encryption_method"),
-                    "encryption_level": safe_get_attr(doc, "get_encryption_level"),
-                    "user_permissions": safe_get_attr(doc, "get_user_permissions")
+                    "encryption_method": metadata.get("encryption", "Not available"),
+                    "permissions": get_human_readable_pdf_permissions(permissions)
                 }
             
             result["additional_properties"] = {

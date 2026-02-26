@@ -166,14 +166,15 @@ def _check_page_javascript(doc, findings):
     try:
         for page_num, page in enumerate(doc):
             try:
-                page_dict = page.get_contents()
-                if not page_dict:
+                xrefs = page.get_contents()
+                if not xrefs:
                     continue
-                    
-                for content in page_dict:
-                    if isinstance(content, bytes):
-                        content_str = content.decode('utf-8', errors='ignore')
-
+                for xref in xrefs:
+                    try:
+                        stream = doc.xref_stream(xref)
+                        if not stream:
+                            continue
+                        content_str = stream.decode('utf-8', errors='ignore')
                         if 'JavaScript' in content_str or '/JS' in content_str:
                             js_content = _extract_js_from_content(content_str)
                             if js_content:
@@ -183,9 +184,10 @@ def _check_page_javascript(doc, findings):
                                     js_content,
                                     js_content
                                 )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.debug(f"Error checking page {page_num}: {str(e)}")
-                
     except Exception as e:
         findings.add_error(f"Page JavaScript check error: {str(e)}")
 
@@ -256,17 +258,16 @@ def _check_annotation_javascript(doc, findings):
                                 js_content
                             )
                         else:
-
-                            annot_dict = annot.get_text_page()
-                            if annot_dict:
-                                annot_info = str(annot_dict)
-                                annot_lower = annot_info.lower()
-                                if 'javascript' in annot_lower or '/js' in annot_lower:
+                            xref = annot.xref
+                            if xref:
+                                obj_str = doc.xref_object(xref)
+                                obj_lower = obj_str.lower()
+                                if 'javascript' in obj_lower or '/js' in obj_lower:
                                     findings.add_javascript(
                                         "Annotation Content",
                                         f"Page {page_num + 1}, Annotation",
                                         "JavaScript reference detected in annotation",
-                                        annot_info
+                                        obj_str
                                     )
                                     
                     except Exception as e:
