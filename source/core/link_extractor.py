@@ -1,11 +1,14 @@
 import fitz
 import requests
 import os
+import time
 from typing import List, Dict, Optional, Tuple, Set
 from .config_manager import get_api_key, get_api_limit
 from .utils import get_confirmation
 
 REQUEST_TIMEOUT = 30
+ANALYSIS_POLL_INTERVAL = 3
+ANALYSIS_MAX_POLLS = 10
 
 
 
@@ -91,15 +94,26 @@ class LinkExtractor:
                 timeout=REQUEST_TIMEOUT, 
                 verify=True
             )
-            response.raise_for_status()
-            
-            analysis_id = response.json()["data"]["id"]
-            result_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
-            response = requests.get(result_url, headers=headers, timeout=REQUEST_TIMEOUT, verify=True)
-            response.raise_for_status()
-            result = response.json()
+            # The submission consumed quota regardless of what happens next, so
+            # count it and mark the URL as checked before any later step can fail
             self.api_calls_made += 1
             self.checked_urls.add(url)
+            response.raise_for_status()
+
+            analysis_id = response.json()["data"]["id"]
+            result_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+            # URL analyses are asynchronous: poll until the scan completes or we give up
+            result = None
+            for attempt in range(ANALYSIS_MAX_POLLS):
+                response = requests.get(result_url, headers=headers, timeout=REQUEST_TIMEOUT, verify=True)
+                self.api_calls_made += 1
+                response.raise_for_status()
+                result = response.json()
+                status = result.get("data", {}).get("attributes", {}).get("status")
+                if status == "completed":
+                    break
+                if attempt < ANALYSIS_MAX_POLLS - 1:
+                    time.sleep(ANALYSIS_POLL_INTERVAL)
             return result
             
         except requests.exceptions.Timeout:
@@ -175,13 +189,17 @@ def main(pdf_path: str, defanged: bool = False, validate_pdf_file=None):
                 result = extractor.check_link_virustotal(link)
                 
                 if result:
-                    stats = result.get("data", {}).get("attributes", {}).get("stats", {})
-                    print("   VirusTotal Results:")
-                    print(f"   - Harmless: {stats.get('harmless', 0)}")
-                    print(f"   - Malicious: {stats.get('malicious', 0)}")
-                    print(f"   - Suspicious: {stats.get('suspicious', 0)}")
-                    print(f"   - Undetected: {stats.get('undetected', 0)}")
                     checked_count += 1
+                    attrs = result.get("data", {}).get("attributes", {})
+                    if attrs.get("status") not in (None, "completed"):
+                        print("   VirusTotal analysis still pending; try again later for results.")
+                    else:
+                        stats = attrs.get("stats", {})
+                        print("   VirusTotal Results:")
+                        print(f"   - Harmless: {stats.get('harmless', 0)}")
+                        print(f"   - Malicious: {stats.get('malicious', 0)}")
+                        print(f"   - Suspicious: {stats.get('suspicious', 0)}")
+                        print(f"   - Undetected: {stats.get('undetected', 0)}")
                 else:
                     print("   VirusTotal check failed. Please check your API key or try again later.")
             

@@ -3,10 +3,10 @@ from pathlib import Path
 import fitz
 from datetime import datetime, timezone
 from .hash_checker import calculate_file_hashes, check_virustotal as check_vt_hash
-from .link_extractor import extract_links, check_link_virustotal, defang_url
+from .link_extractor import extract_links, defang_url, LinkExtractor
 from .metadata_analyzer import analyze_pdf_metadata
 from .javascript_detector import extract_javascript_from_pdf
-from .config_manager import get_api_key, get_api_limit
+from .config_manager import get_api_key, get_api_limit, ConfigError
 from .utils import get_confirmation
 
 PDFCHECKER_VERSION = "1.0"
@@ -187,17 +187,26 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
         if analysis_result.links:
             page.insert_text((50, y), f"{len(analysis_result.links)} links found.", fontsize=10)
             y += 20
-            
+
+            # Share one extractor across all links so the API call limit is enforced
+            link_checker = None
+            if check_virustotal:
+                link_checker = LinkExtractor()
+                link_checker._initialize_api_config()
+
             for i, link in enumerate(analysis_result.links, 1):
                 y, page = check_page_break(y, page, doc)
                 display_link = defang_url(link) if defang else link
                 page.insert_text((50, y), f"{i}. {display_link}", fontsize=10)
                 y += 15
-                
+
                 if check_virustotal:
                     y, page = check_page_break(y, page, doc)
-                    vt_result = check_link_virustotal(link)
-                    result = format_virustotal_url_result(vt_result)
+                    if link_checker.api_calls_made >= link_checker.api_limit:
+                        result = "Skipped: VirusTotal API call limit reached."
+                    else:
+                        vt_result = link_checker.check_link_virustotal(link)
+                        result = format_virustotal_url_result(vt_result)
                     for line in result.split('\n'):
                         y, page = check_page_break(y, page, doc)
                         page.insert_text((70, y), line, fontsize=9)
@@ -349,20 +358,24 @@ def format_virustotal_file_result(vt_report):
 def format_virustotal_url_result(vt_result):
     if not vt_result:
         return "VirusTotal API call failed. Please check your API key or try again later."
-    
-    stats = vt_result.get("data", {}).get("attributes", {}).get("stats", {})
+
+    attrs = vt_result.get("data", {}).get("attributes", {})
+    if attrs.get("status") not in (None, "completed"):
+        return "VirusTotal analysis still pending. Results were not available at report time."
+
+    stats = attrs.get("stats", {})
     total = sum(stats.values())
-    
+
     if total == 0:
         return "URL not found in VirusTotal database. No previous analysis available."
-    
+
     result = "VirusTotal Results:"
     result += f"\n- Harmless: {stats.get('harmless', 0)}"
     result += f"\n- Malicious: {stats.get('malicious', 0)}"
     result += f"\n- Suspicious: {stats.get('suspicious', 0)}"
     result += f"\n- Undetected: {stats.get('undetected', 0)}"
-    
-    last_scan_date = vt_result.get("data", {}).get("attributes", {}).get("last_analysis_date")
+
+    last_scan_date = attrs.get("last_analysis_date")
     if last_scan_date:
         try:
             scan_datetime = datetime.fromtimestamp(last_scan_date, tz=timezone.utc)
@@ -378,8 +391,14 @@ def main(pdf_path, validate_pdf_file=None):
         return
         
     operator_name = input("\nPlease type your name (enter to skip): ").strip()[:MAX_OPERATOR_NAME_LENGTH]
-    
-    success, api_key = get_api_key()
+
+    # get_api_key raises when no secure keyring backend is available
+    try:
+        success, api_key = get_api_key()
+    except ConfigError as e:
+        print(f"Warning: Could not access VirusTotal API key: {e}")
+        success, api_key = False, None
+
     check_vt = False
     defang = False
 

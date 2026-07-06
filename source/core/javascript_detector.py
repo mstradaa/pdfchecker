@@ -66,7 +66,6 @@ def extract_javascript_from_pdf(pdf_path, validate_pdf_file=None):
             _check_page_javascript(doc, js_findings)
             _check_form_javascript(doc, js_findings)
             _check_annotation_javascript(doc, js_findings)
-            _check_action_javascript(doc, js_findings)
             
 
             if js_findings.javascript_sources:
@@ -136,7 +135,7 @@ class JSFindings:
             "extraction_errors": self.extraction_errors
         }
 
-# search for JavaScript in the document catalog
+# search for JavaScript in document objects, labeling open actions separately
 def _check_document_javascript(doc, findings):
     try:
 
@@ -148,16 +147,17 @@ def _check_document_javascript(doc, findings):
                 if "/JavaScript" in obj or "/JS" in obj:
                     js_content = _extract_js_from_object(doc, obj, xref_num)
                     if js_content:
-                        findings.add_javascript(
-                            "Document Catalog",
-                            f"XRef {xref_num}",
-                            js_content,
-                            js_content
-                        )
+                        if "/OpenAction" in obj:
+                            source = "Open Action"
+                            location = f"Document Open Action (XRef {xref_num})"
+                        else:
+                            source = "Document Catalog"
+                            location = f"XRef {xref_num}"
+                        findings.add_javascript(source, location, js_content, js_content)
             except Exception as e:
                 logger.debug(f"Error checking xref {xref_num}: {str(e)}")
                 findings.add_error(f"XRef {xref_num} error: {str(e)}")
-                
+
     except Exception as e:
         findings.add_error(f"Document JavaScript check error: {str(e)}")
 
@@ -248,28 +248,20 @@ def _check_annotation_javascript(doc, findings):
                     
                 for annot in annotations:
                     try:
+                        # JavaScript lives in annotation actions (/A << /S /JavaScript /JS ... >>),
+                        # not in a dedicated annotation type, so inspect the raw object
+                        xref = annot.xref
+                        if xref:
+                            obj_str = doc.xref_object(xref)
+                            if '/JavaScript' in obj_str or '/JS' in obj_str:
+                                js_content = _extract_js_from_object(doc, obj_str, xref)
+                                findings.add_javascript(
+                                    "Annotation",
+                                    f"Page {page_num + 1}, Annotation",
+                                    js_content if js_content else "JavaScript reference detected in annotation",
+                                    js_content if js_content else obj_str
+                                )
 
-                        if annot.type[0] == 8:
-                            js_content = annot.info.get('content', 'JavaScript action detected')
-                            findings.add_javascript(
-                                "Annotation",
-                                f"Page {page_num + 1}, Annotation",
-                                js_content,
-                                js_content
-                            )
-                        else:
-                            xref = annot.xref
-                            if xref:
-                                obj_str = doc.xref_object(xref)
-                                obj_lower = obj_str.lower()
-                                if 'javascript' in obj_lower or '/js' in obj_lower:
-                                    findings.add_javascript(
-                                        "Annotation Content",
-                                        f"Page {page_num + 1}, Annotation",
-                                        "JavaScript reference detected in annotation",
-                                        obj_str
-                                    )
-                                    
                     except Exception as e:
                         logger.debug(f"Error checking annotation on page {page_num}: {str(e)}")
                         
@@ -278,30 +270,6 @@ def _check_annotation_javascript(doc, findings):
                 
     except Exception as e:
         findings.add_error(f"Annotation JavaScript check error: {str(e)}")
-
-# detect JavaScript triggered by document actions
-def _check_action_javascript(doc, findings):
-    try:
-        xref_length = doc.xref_length()
-        for xref_num in range(1, xref_length):
-            try:
-                obj = doc.xref_object(xref_num)
-
-                if "/OpenAction" in obj and ("/JavaScript" in obj or "/JS" in obj):
-                    js_content = _extract_js_from_object(doc, obj, xref_num)
-                    if js_content:
-                        findings.add_javascript(
-                            "Open Action",
-                            f"Document Open Action (XRef {xref_num})",
-                            js_content,
-                            js_content
-                        )
-            except Exception as e:
-                logger.debug(f"Error checking open actions at xref {xref_num}: {str(e)}")
-                
-    except Exception as e:
-        findings.add_error(f"Action JavaScript check error: {str(e)}")
-
 
 def _extract_js_from_object(doc, obj_str, xref_num):
     try:

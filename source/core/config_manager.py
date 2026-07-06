@@ -11,6 +11,8 @@ SERVICE_NAME = "PDFChecker"
 ACCOUNT_NAME = "VirusTotalAPI"
 API_LIMIT_KEY = "APILimit"
 DEFAULT_API_LIMIT = 10
+MIN_API_LIMIT = 1
+MAX_API_LIMIT = 10000
 API_KEY_LENGTH = 64
 API_KEY_PATTERN = re.compile(r'^[0-9a-fA-F]{64}$')
 
@@ -134,8 +136,11 @@ def get_api_limit() -> Tuple[bool, int]:
         if not limit_str:
             return True, DEFAULT_API_LIMIT
         limit = int(limit_str)
+        # Stored value may have been written by other tools or older versions
+        if not (MIN_API_LIMIT <= limit <= MAX_API_LIMIT):
+            return False, DEFAULT_API_LIMIT
         return True, limit
-        
+
     except (keyring.errors.KeyringError, ValueError):
         return False, DEFAULT_API_LIMIT
 
@@ -145,10 +150,10 @@ def set_api_limit(limit: int) -> Tuple[bool, str]:
         return False, "No secure keyring backend available"
     if not isinstance(limit, int):
         return False, "API limit must be an integer."
-    if limit < 1:
+    if limit < MIN_API_LIMIT:
         return False, "API limit must be a positive integer."
-    if limit > 10000:
-        return False, "API limit cannot exceed 10,000."
+    if limit > MAX_API_LIMIT:
+        return False, f"API limit cannot exceed {MAX_API_LIMIT:,}."
     try:
         keyring.set_password(SERVICE_NAME, API_LIMIT_KEY, str(limit))
         return True, f"API call limit successfully set to {limit}."

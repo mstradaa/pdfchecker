@@ -36,28 +36,35 @@ def _parse_pdf_date(date_str):
     try:
         if date_str.startswith('D:'):
             date_str = date_str[2:]
-        
-        if len(date_str) < 14:
+
+        # Per the PDF spec everything after the year is optional
+        # (D:YYYYMMDDHHmmSS), with month/day defaulting to 1 and time to 0
+        if len(date_str) < 4:
             return None
-            
+
         year = int(date_str[:4])
-        month = int(date_str[4:6])
-        day = int(date_str[6:8])
-        hour = int(date_str[8:10])
-        minute = int(date_str[10:12])
-        second = int(date_str[12:14])
-        
-        # Parse timezone offset if present (e.g. +05'30', -04'00', Z)
-        tz_info = timezone.utc
+        month = int(date_str[4:6]) if len(date_str) >= 6 else 1
+        day = int(date_str[6:8]) if len(date_str) >= 8 else 1
+        hour = int(date_str[8:10]) if len(date_str) >= 10 else 0
+        minute = int(date_str[10:12]) if len(date_str) >= 12 else 0
+        second = int(date_str[12:14]) if len(date_str) >= 14 else 0
+
+        # Parse timezone offset if present (e.g. +05'30', -04'00', Z);
+        # per the spec a missing offset means the timezone is unknown, so
+        # the result stays naive rather than being assumed UTC
+        tz_info = None
         tz_suffix = date_str[14:].strip("'")
-        if tz_suffix and tz_suffix != 'Z':
-            tz_match = re.match(r"([+-])(\d{2})'?(\d{2})?'?", tz_suffix)
-            if tz_match:
-                sign = 1 if tz_match.group(1) == '+' else -1
-                tz_hours = int(tz_match.group(2))
-                tz_minutes = int(tz_match.group(3)) if tz_match.group(3) else 0
-                tz_info = timezone(timedelta(hours=sign * tz_hours, minutes=sign * tz_minutes))
-        
+        if tz_suffix:
+            if tz_suffix.startswith('Z'):
+                tz_info = timezone.utc
+            else:
+                tz_match = re.match(r"([+-])(\d{2})'?(\d{2})?'?", tz_suffix)
+                if tz_match:
+                    sign = 1 if tz_match.group(1) == '+' else -1
+                    tz_hours = int(tz_match.group(2))
+                    tz_minutes = int(tz_match.group(3)) if tz_match.group(3) else 0
+                    tz_info = timezone(timedelta(hours=sign * tz_hours, minutes=sign * tz_minutes))
+
         dt = datetime(year, month, day, hour, minute, second, tzinfo=tz_info)
         return str(dt)
     except (ValueError, IndexError) as e:
@@ -215,9 +222,16 @@ def _analyze_pages_combined(doc):
                 annot_type = annot.type
                 if not page_analysis["has_form_fields"] and annot_type[1] == "Widget":
                     page_analysis["has_form_fields"] = True
-                
-                if not page_analysis["has_javascript"] and annot_type[0] == 8:
-                    page_analysis["has_javascript"] = True
+
+                # JavaScript lives in annotation actions, not in an annotation type,
+                # so inspect the raw annotation object for /JavaScript or /JS keys
+                if not page_analysis["has_javascript"] and annot.xref:
+                    try:
+                        annot_obj = doc.xref_object(annot.xref)
+                        if '/JavaScript' in annot_obj or '/JS' in annot_obj:
+                            page_analysis["has_javascript"] = True
+                    except Exception as e:
+                        logger.debug(f"Error reading annotation object: {str(e)}")
             
             if not page_analysis["has_images"]:
                 page_analysis["has_images"] = bool(safe_get_attr(page, "get_images", []))
@@ -350,7 +364,8 @@ def analyze_pdf_metadata(pdf_path, validate_pdf_file=None, file_stats=None):
             
             result["content_info"] = content_info
             
-            if is_encrypted:
+            # safe_get_attr returns a truthy "Not available" string on failure
+            if is_encrypted is True:
                 result["security_info"] = {
                     "encryption_method": metadata.get("encryption", "Not available"),
                     "permissions": get_human_readable_pdf_permissions(permissions)

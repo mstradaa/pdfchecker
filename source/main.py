@@ -76,9 +76,10 @@ def secure_set_api_key():
         handle_config_error("API key setting", e)
 
 def mask_api_key(api_key: str) -> str:
-    if not api_key or len(api_key) < 16:
+    # Only reveal the first/last 8 chars when at least half the key stays masked
+    if not api_key or len(api_key) < 32:
         return "***masked***"
-    
+
     mask_length = len(api_key) - 16
     return f"{api_key[:8]}{'*' * mask_length}{api_key[-8:]}"
 
@@ -127,21 +128,26 @@ def handle_api_limit_edit():
     
     try:
         new_limit_input = get_user_input("Enter new API call limit (press Enter to keep current): ")
-        
+
         if not new_limit_input:
             return
-            
-        new_limit = int(new_limit_input)
-        
+
+        try:
+            new_limit = int(new_limit_input)
+        except ValueError:
+            print("Error: Please enter a valid integer.")
+            return
+
         if not (1 <= new_limit <= 10000):
             print("Error: API limit must be between 1 and 10000!")
             return
-            
+
         success, message = config_manager.set_api_limit(new_limit)
         print(f"{'Success' if success else 'Error'}: {message}")
-        
-    except ValueError:
-        print("Error: Please enter a valid integer.")
+
+    except ValueError as e:
+        # Raised by get_user_input for oversized input
+        print(f"Error: {e}")
     except KeyboardInterrupt:
         print("\nOperation cancelled.")
 
