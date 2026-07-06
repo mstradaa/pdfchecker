@@ -1,30 +1,31 @@
-# PDF Checker
+# PDF Security Checker
 
-![pdfc_logo](https://github.com/user-attachments/assets/9b3d7f17-e3b1-4238-92dc-7231323eede6)
+![pdfc_logo](./docs/logo.png)
 
 ## Overview
 
-**PDF Checker** is a cross-platform tool designed to evaluate PDF files for security threats and extract forensic-value information. It detects malicious indicators through hash validation, embedded script analysis, and metadata inspection. Reports are generated with forensic integrity in mind, incorporating cryptographic proof and principles of reproducibility.
+**PDF Security Checker** is a cross-platform tool designed to evaluate PDF files for security threats and extract forensic-value information. It detects malicious indicators through hash validation, embedded script analysis, and metadata inspection. Reports are generated with forensic integrity in mind, incorporating cryptographic proof and principles of reproducibility.
 
-You can find the tool chart [here](https://github.com/Strateo/pdfchecker/blob/main/docs/Mermaid_architecture.png) and a sample of the generated report [here](https://github.com/Strateo/pdfchecker/blob/main/docs/Report_sample.pdf).
+You can find a sample of the generated report [here](https://github.com/Strateo/pdfchecker/blob/main/docs/Report_sample.pdf).
 
 ## Features
 
-### 1. Hash Calculation and Verification
-- **MD5, SHA-1, and SHA-256 Hashes**: Calculates cryptographic hashes for PDF files to ensure data integrity and verify authenticity.
-- **VirusTotal Integration**: Optionally checks the SHA-256 hash against VirusTotal's database to identify known malicious files.
-
-### 2. Link Extraction and Analysis
+### 1. Link Extraction and Analysis
 - **URI Extraction**: Identifies and extracts all URI links embedded within a PDF file.
 - **VirusTotal URL Check**: Optionally checks extracted URLs against VirusTotal to assess potential threats.
 - **Defanged URL Display**: Provides an option to display URLs in a defanged format to prevent accidental clicks.
 
-### 3. Metadata and JavaScript Analysis
+### 2. Metadata and JavaScript Analysis
 - **Metadata Extraction**: Retrieves and displays metadata information, including document properties, system properties and PDF/A or PDF/X compliance.
 - **File System Attributes**: Provides detailed file system attributes such as size, creation date, last access date and permissions.
 
 - **JavaScript Extraction**: Identifies and extracts JavaScript code from various sections of a PDF, including document-level, page-level, and form fields.
 - **Suspicious Pattern Analysis**: Analyzes extracted JavaScript for patterns that may indicate malicious intent.
+
+### 3. Hash Calculation and Verification
+
+- **MD5, SHA-1, and SHA-256 Hashes**: Calculates cryptographic hashes for PDF files to ensure data integrity and verify authenticity.
+- **VirusTotal Integration**: Optionally checks the SHA-256 hash against VirusTotal's database to identify known malicious files.
 
 ### 4. Report Generation
 - **Detailed PDF Reports**: Generates comprehensive reports that include all the modules above, such as hash values, link analysis, metadata, and JavaScript findings.
@@ -51,11 +52,29 @@ pip install -e .
 
 The tool provides a command-line interface with the following options:
 
-- `-hc, --hash-checker <PDF_FILE>`: Generate hash values for a PDF file.
-- `-l, --links <PDF_FILE>`: Extract, defang, and optionally enrich links from a PDF file.
-- `-m, --metadata <PDF_FILE>`: Extract and display PDF metadata information.
-- `-js, --javascript <PDF_FILE>`: Analyze and detect JavaScript in the PDF file.
-- `-r, --report <PDF_FILE>`: Generate a PDF report with hash, links, metadata, JavaScript information and optional VT enrichment.
+- `-hc, --hash-checker <PDF_FILE_OR_DIR>`: Generate hash values for a PDF file.
+- `-l, --links <PDF_FILE_OR_DIR>`: Extract, defang, and optionally enrich links from a PDF file.
+- `-m, --metadata <PDF_FILE_OR_DIR>`: Extract and display PDF metadata information.
+- `-js, --javascript <PDF_FILE_OR_DIR>`: Analyze and detect JavaScript in the PDF file.
+- `-r, --report <PDF_FILE_OR_DIR>`: Generate a PDF report with hash, links, metadata, JavaScript information and optional VT enrichment.
+
+### Bulk Mode
+
+Every analysis option also accepts a folder path. When a folder is provided, PDFChecker switches to bulk mode: it lists the PDF files found in the folder (non-recursive) and asks for a Y/N confirmation before scanning them.
+
+```bash
+# Analyze a single PDF
+python source/main.py -m suspicious.pdf
+
+# Analyze every PDF in a folder (asks for confirmation first)
+python source/main.py -m ./samples/
+```
+
+Bulk mode behavior:
+- Interactive questions (VirusTotal enrichment, defanged output, operator name) are asked once and applied to all files.
+- Per-file work runs in parallel: hashing uses a thread pool, while PyMuPDF-based analyses (links, metadata, JavaScript, reports) run in isolated worker processes, so a malformed PDF cannot take down the whole batch.
+- VirusTotal checks share a single API call budget across the entire batch, and a URL appearing in multiple PDFs is only checked once.
+- Files larger than the 100MB limit are skipped with a notice; in report mode, previously generated `*_report.pdf` files are excluded automatically.
 
 ### VirusTotal API Key Management
 
@@ -90,7 +109,6 @@ The tool provides a command-line interface with the following options:
 - Sanitized logs to exclude sensitive or identifying information.
 
 ## Future Enhancements & Roadmap
-- [ ] Bulk operation support.
 - [ ] Abuse.ch enrichment support.
 - [ ] Risk scoring based on links, JS, metadata, and structural anomalies.
 - [ ] Export extracted indicators (URLs, domains, JS strings) in STIX / JSON.

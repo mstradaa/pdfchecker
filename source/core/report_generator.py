@@ -111,7 +111,7 @@ def analyze_pdf_once(pdf_path, validate_pdf_file=None):
 
     return result
 
-def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=None, validate_pdf_file=None):
+def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=None, validate_pdf_file=None, link_checker=None):
     try:
         if operator_name and len(operator_name) > MAX_OPERATOR_NAME_LENGTH:
             operator_name = operator_name[:MAX_OPERATOR_NAME_LENGTH-3] + "..."
@@ -188,9 +188,9 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
             page.insert_text((50, y), f"{len(analysis_result.links)} links found.", fontsize=10)
             y += 20
 
-            # Share one extractor across all links so the API call limit is enforced
-            link_checker = None
-            if check_virustotal:
+            # Share one extractor across all links so the API call limit is
+            # enforced; bulk mode passes its own so the limit spans all files
+            if check_virustotal and link_checker is None:
                 link_checker = LinkExtractor()
                 link_checker._initialize_api_config()
 
@@ -202,7 +202,9 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
 
                 if check_virustotal:
                     y, page = check_page_break(y, page, doc)
-                    if link_checker.api_calls_made >= link_checker.api_limit:
+                    if link in link_checker.checked_urls:
+                        result = "Skipped: URL already checked in this operation."
+                    elif link_checker.api_calls_made >= link_checker.api_limit:
                         result = "Skipped: VirusTotal API call limit reached."
                     else:
                         vt_result = link_checker.check_link_virustotal(link)

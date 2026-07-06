@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 import os
-from core import config_manager
+from core import bulk_processor, config_manager
 from core.config_manager import ConfigError, KeyringError
 from core.hash_checker import main as hash_checker_main
 from core.link_extractor import main as link_extractor_main
@@ -152,19 +152,32 @@ def handle_api_limit_edit():
         print("\nOperation cancelled.")
 
 def handle_pdf_analysis(args):
+    # (single-file handler, bulk-folder handler, operation label)
     analysis_map = {
-        'hash_checker': lambda: hash_checker_main(args.hash_checker, validate_pdf_file=validate_pdf_file),
-        'links': lambda: handle_link_extraction(args.links),
-        'metadata': lambda: handle_metadata_analysis(args.metadata),
-        'javascript': lambda: handle_javascript_analysis(args.javascript),
-        'report': lambda: report_generator_main(args.report, validate_pdf_file=validate_pdf_file)
+        'hash_checker': (lambda target: hash_checker_main(target, validate_pdf_file=validate_pdf_file),
+                         bulk_processor.bulk_hash_check, 'hash checking'),
+        'links': (handle_link_extraction,
+                  bulk_processor.bulk_link_extraction, 'link extraction'),
+        'metadata': (handle_metadata_analysis,
+                     bulk_processor.bulk_metadata_analysis, 'metadata analysis'),
+        'javascript': (handle_javascript_analysis,
+                       bulk_processor.bulk_javascript_analysis, 'JavaScript analysis'),
+        'report': (lambda target: report_generator_main(target, validate_pdf_file=validate_pdf_file),
+                   bulk_processor.bulk_report_generation, 'report generation')
     }
-    
-    for arg_name, handler in analysis_map.items():
-        if getattr(args, arg_name):
-            handler()
+
+    for arg_name, (handler, bulk_handler, label) in analysis_map.items():
+        target = getattr(args, arg_name)
+        if target:
+            if Path(target).is_dir():
+                bulk_processor.run_bulk_analysis(
+                    target, label, bulk_handler,
+                    exclude_reports=(arg_name == 'report')
+                )
+            else:
+                handler(target)
             return True
-    
+
     return False
 
 def handle_link_extraction(pdf_file):
@@ -197,16 +210,16 @@ def handle_javascript_analysis(pdf_file):
 def create_argument_parser():
     parser = argparse.ArgumentParser(description='PDF Checker Tool')
     
-    parser.add_argument('-hc', '--hash-checker', metavar='PDF_FILE',
-                      help='Generate hash values for a PDF file')
-    parser.add_argument('-l', '--links', metavar='PDF_FILE',
-                      help='Extract and check links from a PDF file')
-    parser.add_argument('-m', '--metadata', metavar='PDF_FILE',
-                      help='Extract and display PDF metadata information')
-    parser.add_argument('-js', '--javascript', metavar='PDF_FILE',
-                      help='Analyze and detect JavaScript in a PDF file')
-    parser.add_argument('-r', '--report', metavar='PDF_FILE',
-                      help='Generate a comprehensive PDF report with hash, links, metadata, and JavaScript analysis')
+    parser.add_argument('-hc', '--hash-checker', metavar='PDF_FILE_OR_DIR',
+                      help='Generate hash values for a PDF file, or for all PDFs in a folder (bulk mode)')
+    parser.add_argument('-l', '--links', metavar='PDF_FILE_OR_DIR',
+                      help='Extract and check links from a PDF file, or from all PDFs in a folder (bulk mode)')
+    parser.add_argument('-m', '--metadata', metavar='PDF_FILE_OR_DIR',
+                      help='Extract and display PDF metadata information, for a single PDF or all PDFs in a folder (bulk mode)')
+    parser.add_argument('-js', '--javascript', metavar='PDF_FILE_OR_DIR',
+                      help='Analyze and detect JavaScript in a PDF file, or in all PDFs in a folder (bulk mode)')
+    parser.add_argument('-r', '--report', metavar='PDF_FILE_OR_DIR',
+                      help='Generate a comprehensive PDF report with hash, links, metadata, and JavaScript analysis, for a single PDF or all PDFs in a folder (bulk mode)')
     
     vt_group = parser.add_argument_group('VirusTotal API Key Management')
     vt_group.add_argument('--set-api-key', action='store_true',
