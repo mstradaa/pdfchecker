@@ -6,6 +6,10 @@ from .hash_checker import calculate_file_hashes, check_virustotal as check_vt_ha
 from .link_extractor import extract_links, defang_url, LinkExtractor
 from .metadata_analyzer import analyze_pdf_metadata
 from .javascript_detector import extract_javascript_from_pdf
+from .structure_analyzer import analyze_structure
+from .embedded_file_detector import detect_embedded_files
+from .qr_detector import detect_qr_codes, QR_UNAVAILABLE_MESSAGE
+from .risk_scorer import compute_risk_score
 from .config_manager import get_api_key, get_api_limit, ConfigError
 from .utils import get_confirmation
 
@@ -81,6 +85,10 @@ class PDFAnalysisResult:
         self.links = None
         self.metadata = None
         self.javascript = None
+        self.structure = None
+        self.embedded = None
+        self.qr = None
+        self.risk = None
         self.errors = []
 
 def analyze_pdf_once(pdf_path, validate_pdf_file=None):
@@ -89,19 +97,38 @@ def analyze_pdf_once(pdf_path, validate_pdf_file=None):
 
     try:
         original_stats = os.stat(pdf_path)
+    except Exception as e:
+        result.errors.append(f"Analysis error: {str(e)}")
+        return result
+
+    # Each analysis is isolated so one failure does not lose the rest of
+    # the report
+    try:
         result.metadata = analyze_pdf_metadata(
             pdf_path, validate_pdf_file=validate_pdf_file, file_stats=original_stats
         )
-
-        result.hashes = calculate_file_hashes(pdf_path)
-
-        result.links = extract_links(pdf_path)
-
-        result.javascript = extract_javascript_from_pdf(
-            pdf_path, validate_pdf_file=validate_pdf_file
-        )
     except Exception as e:
-        result.errors.append(f"Analysis error: {str(e)}")
+        result.errors.append(f"Metadata analysis error: {str(e)}")
+
+    try:
+        result.hashes = calculate_file_hashes(pdf_path)
+    except Exception as e:
+        result.errors.append(f"Hash calculation error: {str(e)}")
+
+    content_analyses = [
+        ('links', lambda: extract_links(pdf_path)),
+        ('javascript', lambda: extract_javascript_from_pdf(
+            pdf_path, validate_pdf_file=validate_pdf_file)),
+        ('structure', lambda: analyze_structure(pdf_path)),
+        ('embedded', lambda: detect_embedded_files(pdf_path)),
+        ('qr', lambda: detect_qr_codes(pdf_path)),
+    ]
+    try:
+        for attr, analysis in content_analyses:
+            try:
+                setattr(result, attr, analysis())
+            except Exception as e:
+                result.errors.append(f"{attr} analysis error: {str(e)}")
     finally:
         if original_stats:
             try:
@@ -109,9 +136,27 @@ def analyze_pdf_once(pdf_path, validate_pdf_file=None):
             except Exception:
                 pass
 
+    result.risk = compute_risk_score(
+        js_findings=result.javascript,
+        structure_findings=result.structure,
+        embedded_findings=result.embedded,
+        links=result.links,
+        qr_findings=result.qr
+    )
+
     return result
 
-def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=None, validate_pdf_file=None, link_checker=None):
+# insert one logical line, wrapped and page-break safe; returns updated (y, page)
+def _insert_wrapped(page, doc, y, text, x=50, fontsize=10, step=15, max_length=80):
+    for line in _wrap_text_for_pdf(text, max_length=max_length):
+        y, page = check_page_break(y, page, doc)
+        page.insert_text((x, y), line, fontsize=fontsize)
+        y += step
+    return y, page
+
+
+def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=None,
+                  validate_pdf_file=None, link_checker=None):
     try:
         if operator_name and len(operator_name) > MAX_OPERATOR_NAME_LENGTH:
             operator_name = operator_name[:MAX_OPERATOR_NAME_LENGTH-3] + "..."
@@ -134,7 +179,7 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
             counter += 1
         
         analysis_result = analyze_pdf_once(pdf_path, validate_pdf_file)
-        
+
         doc = fitz.open()
         
         page = doc.new_page()
@@ -159,9 +204,43 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
         if operator_name:
             page.insert_text((50, y), f"Operator: {operator_name}", fontsize=10)
             y += 20
-        
+
         y += 15
 
+        y, page = check_page_break(y, page, doc)
+        page.insert_text((50, y), "Risk Assessment:", fontsize=14, fontname='helv')
+        y += 25
+
+        risk = analysis_result.risk
+        if risk:
+            page.insert_text(
+                (50, y),
+                f"Overall Risk Score: {risk['score']}/{risk['max_score']} ({risk['level'].upper()})",
+                fontsize=12, fontname='helv'
+            )
+            y += 20
+            for adjustment in risk.get('adjustments', []):
+                y, page = _insert_wrapped(page, doc, y, f"NOTE: {adjustment}",
+                                          x=70, fontsize=9, step=12)
+            for name, category in risk['categories'].items():
+                y, page = check_page_break(y, page, doc)
+                label = name.replace('_', ' ').title()
+                page.insert_text((70, y), f"{label}: {category['score']}/{category['max']}",
+                                 fontsize=10)
+                y += 15
+                for reason in category['reasons'][:MAX_LINES_PER_SECTION]:
+                    y, page = _insert_wrapped(page, doc, y, f"- {_clean_text_for_pdf(reason)}",
+                                              x=90, fontsize=9, step=12)
+                if len(category['reasons']) > MAX_LINES_PER_SECTION:
+                    y, page = check_page_break(y, page, doc)
+                    page.insert_text((90, y), "[Additional indicators truncated...]", fontsize=8)
+                    y += 12
+        else:
+            page.insert_text((50, y), "Risk score not available.", fontsize=10)
+            y += 15
+
+        y += 15
+        y, page = check_page_break(y, page, doc)
         page.insert_text((50, y), "Hash Information:", fontsize=14, fontname='helv')
         y += 25
         
@@ -183,16 +262,17 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
         y, page = check_page_break(y, page, doc)
         page.insert_text((50, y), "Document Links:", fontsize=14, fontname='helv')
         y += 25
-        
+
+        # Share one extractor across all links (and QR URLs below) so the API
+        # call limit is enforced; bulk mode passes its own so the limit spans
+        # all files
+        if check_virustotal and link_checker is None:
+            link_checker = LinkExtractor()
+            link_checker._initialize_api_config()
+
         if analysis_result.links:
             page.insert_text((50, y), f"{len(analysis_result.links)} links found.", fontsize=10)
             y += 20
-
-            # Share one extractor across all links so the API call limit is
-            # enforced; bulk mode passes its own so the limit spans all files
-            if check_virustotal and link_checker is None:
-                link_checker = LinkExtractor()
-                link_checker._initialize_api_config()
 
             for i, link in enumerate(analysis_result.links, 1):
                 y, page = check_page_break(y, page, doc)
@@ -317,7 +397,145 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
         else:
             y, page = check_page_break(y, page, doc)
             page.insert_text((50, y), "Error analyzing JavaScript content.", fontsize=10)
-        
+
+        y += 20
+        y, page = check_page_break(y, page, doc)
+        page.insert_text((50, y), "Embedded Files:", fontsize=14, fontname='helv')
+        y += 25
+
+        embedded = analysis_result.embedded
+        if embedded:
+            page.insert_text((50, y), f"Embedded Files Found: {embedded['embedded_count']}", fontsize=10)
+            y += 15
+            y, page = check_page_break(y, page, doc)
+            page.insert_text((50, y), f"Hidden/Orphaned Streams: {embedded['hidden_stream_count']}", fontsize=10)
+            y += 20
+
+            for i, entry in enumerate(embedded['embedded_files'], 1):
+                y, page = _insert_wrapped(
+                    page, doc, y,
+                    f"{i}. {_clean_text_for_pdf(entry['filename'])} "
+                    f"({entry['size']} bytes) - Risk: {entry['risk']}",
+                    x=70, fontsize=10
+                )
+                y, page = _insert_wrapped(page, doc, y, f"Source: {entry['source']}",
+                                          x=90, fontsize=9, step=12)
+                if entry['content_type']:
+                    y, page = _insert_wrapped(page, doc, y,
+                                              f"Content Type: {entry['content_type']}",
+                                              x=90, fontsize=9, step=12)
+                sha256 = entry['hashes'].get('SHA-256')
+                if sha256:
+                    y, page = _insert_wrapped(page, doc, y, f"SHA-256: {sha256}",
+                                              x=90, fontsize=9, step=12)
+                for reason in entry['risk_reasons']:
+                    y, page = _insert_wrapped(page, doc, y,
+                                              f"WARNING: {_clean_text_for_pdf(reason)}",
+                                              x=90, fontsize=9, step=12)
+                y += 8
+
+            for stream in embedded['hidden_streams']:
+                y, page = _insert_wrapped(
+                    page, doc, y,
+                    f"Hidden stream at XRef {stream['xref']} ({stream['size']} bytes) "
+                    f"- Risk: {stream['risk']}",
+                    x=70, fontsize=10
+                )
+                sha256 = stream['hashes'].get('SHA-256')
+                if sha256:
+                    y, page = _insert_wrapped(page, doc, y, f"SHA-256: {sha256}",
+                                              x=90, fontsize=9, step=12)
+                y += 8
+        else:
+            page.insert_text((50, y), "Embedded file analysis not available.", fontsize=10)
+            y += 15
+
+        y += 20
+        y, page = check_page_break(y, page, doc)
+        page.insert_text((50, y), "Structural Anomalies:", fontsize=14, fontname='helv')
+        y += 25
+
+        structure = analysis_result.structure
+        if structure:
+            page.insert_text((50, y), f"Anomalies Detected: {structure['anomaly_count']}", fontsize=10)
+            y += 20
+            for anomaly in structure['anomalies']:
+                y, page = _insert_wrapped(
+                    page, doc, y,
+                    f"[{anomaly['severity'].upper()}] {anomaly['type']} (x{anomaly['count']})",
+                    x=70, fontsize=10
+                )
+                y, page = _insert_wrapped(page, doc, y,
+                                          _clean_text_for_pdf(anomaly['description']),
+                                          x=90, fontsize=9, step=12)
+                if anomaly['locations']:
+                    y, page = _insert_wrapped(
+                        page, doc, y,
+                        "Locations: " + ", ".join(anomaly['locations']),
+                        x=90, fontsize=9, step=12
+                    )
+                y += 8
+        else:
+            page.insert_text((50, y), "Structure analysis not available.", fontsize=10)
+            y += 15
+
+        y += 20
+        y, page = check_page_break(y, page, doc)
+        page.insert_text((50, y), "QR Codes:", fontsize=14, fontname='helv')
+        y += 25
+
+        qr = analysis_result.qr
+        if qr and qr['supported']:
+            page.insert_text((50, y), f"QR Codes Decoded: {qr['qr_count']}", fontsize=10)
+            y += 15
+            if qr['undecoded_count']:
+                y, page = check_page_break(y, page, doc)
+                page.insert_text((50, y),
+                                 f"QR Codes Detected but Unreadable: {qr['undecoded_count']}",
+                                 fontsize=10)
+                y += 15
+            y += 5
+
+            for i, qr_code in enumerate(qr['qr_codes'], 1):
+                payload = qr_code['payload']
+                is_url = qr_code['type'] == 'URL'
+                display_payload = defang_url(payload) if (is_url and defang) else payload
+                y, page = _insert_wrapped(
+                    page, doc, y,
+                    f"{i}. Page {qr_code['page']} [{qr_code['type']}]: "
+                    f"{_clean_text_for_pdf(display_payload)}",
+                    x=70, fontsize=10
+                )
+
+                if check_virustotal and is_url:
+                    if payload in link_checker.checked_urls:
+                        result = "Skipped: URL already checked in this operation."
+                    elif link_checker.api_calls_made >= link_checker.api_limit:
+                        result = "Skipped: VirusTotal API call limit reached."
+                    else:
+                        vt_result = link_checker.check_link_virustotal(payload)
+                        result = format_virustotal_url_result(vt_result)
+                    for line in result.split('\n'):
+                        y, page = check_page_break(y, page, doc)
+                        page.insert_text((90, y), line, fontsize=9)
+                        y += 12
+                y += 8
+        elif qr:
+            y, page = _insert_wrapped(page, doc, y, QR_UNAVAILABLE_MESSAGE)
+        else:
+            page.insert_text((50, y), "QR analysis not available.", fontsize=10)
+            y += 15
+
+        if analysis_result.errors:
+            y += 20
+            y, page = check_page_break(y, page, doc)
+            page.insert_text((50, y), "Analysis Errors:", fontsize=14, fontname='helv')
+            y += 25
+            for error in analysis_result.errors:
+                y, page = _insert_wrapped(page, doc, y,
+                                          f"- {_clean_text_for_pdf(error)}",
+                                          x=70, fontsize=9, step=12)
+
         doc.save(str(output_path))
         doc.close()
         return str(output_path)
@@ -391,7 +609,7 @@ def format_virustotal_url_result(vt_result):
 def main(pdf_path, validate_pdf_file=None):
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return
-        
+
     operator_name = input("\nPlease type your name (enter to skip): ").strip()[:MAX_OPERATOR_NAME_LENGTH]
 
     # get_api_key raises when no secure keyring backend is available

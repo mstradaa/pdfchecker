@@ -8,11 +8,15 @@ from functools import partial
 from pathlib import Path
 
 from .config_manager import get_api_key, get_api_limit, ConfigError
+from .embedded_file_detector import detect_embedded_files, print_embedded_findings
 from .hash_checker import calculate_file_hashes, check_virustotal, _print_virustotal_results
 from .javascript_detector import extract_javascript_from_pdf, print_javascript_findings
 from .link_extractor import LinkExtractor, defang_url, extract_links, remove_protocol
 from .metadata_analyzer import analyze_pdf_metadata, print_metadata
+from .qr_detector import detect_qr_codes, print_qr_findings, QR_SUPPORT, QR_UNAVAILABLE_MESSAGE
 from .report_generator import create_report, MAX_OPERATOR_NAME_LENGTH
+from .risk_scorer import compute_risk_score
+from .structure_analyzer import analyze_structure, print_structure_findings
 from .utils import get_confirmation
 
 MAX_FILE_SIZE_MB = 100
@@ -107,6 +111,28 @@ def _metadata_worker(pdf_path):
 
 def _javascript_worker(pdf_path):
     return extract_javascript_from_pdf(pdf_path)
+
+
+def _structure_worker(pdf_path):
+    return analyze_structure(pdf_path)
+
+
+def _embedded_worker(pdf_path):
+    return detect_embedded_files(pdf_path)
+
+
+def _qr_worker(pdf_path):
+    return detect_qr_codes(pdf_path)
+
+
+def _risk_worker(pdf_path):
+    return compute_risk_score(
+        js_findings=extract_javascript_from_pdf(pdf_path),
+        structure_findings=analyze_structure(pdf_path),
+        embedded_findings=detect_embedded_files(pdf_path),
+        links=extract_links(pdf_path),
+        qr_findings=detect_qr_codes(pdf_path)
+    )
 
 
 def _report_worker(pdf_path, defang, operator_name):
@@ -314,6 +340,120 @@ def bulk_javascript_analysis(files):
             print(f"Error: {findings}")
         else:
             print_javascript_findings(findings)
+
+
+def bulk_structure_analysis(files):
+    print(f"\nAnalyzing structure of {len(files)} files...")
+    results = _run_parallel(files, _structure_worker, use_processes=True)
+
+    for pdf_path in files:
+        ok, findings = results[pdf_path]
+        print(f"\n=== {Path(pdf_path).name} ===")
+        if not ok:
+            print(f"Error: {findings}")
+        else:
+            print_structure_findings(findings)
+
+
+def bulk_embedded_analysis(files):
+    print(f"\nDetecting embedded files in {len(files)} files...")
+    print("Note: extraction to disk is available in single-file mode only.")
+    results = _run_parallel(files, _embedded_worker, use_processes=True)
+
+    for pdf_path in files:
+        ok, findings = results[pdf_path]
+        print(f"\n=== {Path(pdf_path).name} ===")
+        if not ok:
+            print(f"Error: {findings}")
+        else:
+            print_embedded_findings(findings)
+
+
+def bulk_qr_analysis(files):
+    if not QR_SUPPORT:
+        print(f"\n{QR_UNAVAILABLE_MESSAGE}")
+        return
+
+    defanged = get_confirmation("Do you want to display QR URLs in defanged format?")
+
+    # Same shared-budget model as bulk link extraction: one extractor for the
+    # whole batch, and a URL appearing in several PDFs is only checked once
+    extractor = LinkExtractor()
+    check_vt = False
+    if extractor._initialize_api_config() and extractor.api_key:
+        check_vt = get_confirmation("\nWould you like to check decoded QR URLs with VirusTotal?")
+    else:
+        print("\nVirusTotal API key not found. QR payloads will be listed without checking.")
+
+    print(f"\nScanning {len(files)} files for QR codes...")
+    results = _run_parallel(files, _qr_worker, use_processes=True)
+
+    try:
+        for pdf_path in files:
+            ok, findings = results[pdf_path]
+            print(f"\n=== {Path(pdf_path).name} ===")
+            if not ok:
+                print(f"Error: {findings}")
+                continue
+
+            print_qr_findings(findings, defanged=defanged, defang_url=defang_url)
+
+            if not check_vt or not findings:
+                continue
+            for qr in findings.get("qr_codes", []):
+                if qr["type"] != "URL":
+                    continue
+                url = qr["payload"]
+                display_url = defang_url(url) if defanged else url
+                if url in extractor.checked_urls:
+                    print(f"\n{display_url}: already checked in this bulk operation.")
+                    continue
+                if extractor.api_calls_made >= extractor.api_limit:
+                    print(f"\n{display_url}: skipped due to API limit.")
+                    continue
+                print(f"\nChecking QR URL with VirusTotal: {display_url}")
+                result = extractor.check_link_virustotal(url)
+                if result:
+                    _print_url_vt_result(result)
+                else:
+                    print("   VirusTotal check failed. Please check your API key or try again later.")
+
+        if check_vt:
+            print(f"\nTotal API calls made: {extractor.api_calls_made}")
+    finally:
+        extractor.reset()
+
+
+def bulk_risk_scoring(files):
+    print(f"\nComputing risk scores for {len(files)} files...")
+    results = _run_parallel(files, _risk_worker, use_processes=True)
+
+    # Rank by score so the riskiest files surface first
+    scored = []
+    failed = []
+    for pdf_path in files:
+        ok, assessment = results[pdf_path]
+        if ok and assessment:
+            scored.append((pdf_path, assessment))
+        else:
+            failed.append((pdf_path, assessment))
+    scored.sort(key=lambda item: item[1]["score"], reverse=True)
+
+    print("\n=== Risk Ranking ===")
+    for pdf_path, assessment in scored:
+        print(f"\n[{assessment['score']:3d}/{assessment['max_score']}] "
+              f"{assessment['level'].upper():8s} {Path(pdf_path).name}")
+        for adjustment in assessment.get("adjustments", []):
+            print(f"      NOTE: {adjustment}")
+        top_reasons = [reason for category in assessment["categories"].values()
+                       for reason in category["reasons"]]
+        for reason in top_reasons[:3]:
+            print(f"      - {reason}")
+        if len(top_reasons) > 3:
+            print(f"      ... and {len(top_reasons) - 3} more indicator(s)")
+
+    for pdf_path, error in failed:
+        print(f"\n[ERROR] {Path(pdf_path).name}: {error}")
 
 
 def bulk_report_generation(files):

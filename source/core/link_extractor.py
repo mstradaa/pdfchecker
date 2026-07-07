@@ -147,11 +147,11 @@ def main(pdf_path: str, defanged: bool = False, validate_pdf_file=None):
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return
     extractor = LinkExtractor()
-    
+
     try:
         print(f"Extracting links from {pdf_path}...")
         links = extractor.extract_links_from_pdf(pdf_path)
-    
+
         if not links:
             print("No links found in the PDF.")
             return

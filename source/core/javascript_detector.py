@@ -66,11 +66,11 @@ def extract_javascript_from_pdf(pdf_path, validate_pdf_file=None):
             _check_page_javascript(doc, js_findings)
             _check_form_javascript(doc, js_findings)
             _check_annotation_javascript(doc, js_findings)
-            
+
 
             if js_findings.javascript_sources:
                 js_findings.suspicious_patterns = _analyze_suspicious_patterns(js_findings.javascript_sources)
-            
+
     except Exception as e:
         logger.error(f"Error extracting JavaScript from PDF: {str(e)}")
         js_findings.add_error(f"General extraction error: {str(e)}")
