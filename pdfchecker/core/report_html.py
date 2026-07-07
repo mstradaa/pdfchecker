@@ -178,35 +178,28 @@ def _score_badge(risk, compact=False):
 
 
 def _header(meta, risk):
-    logo_cell = ''
-    if LOGO_PATH.exists():
-        logo_cell = ('<img src="%s" width="112" height="40"/>'
+    # Left column stacks logo (optional), title and file metadata, all left
+    # aligned; the risk badge sits in a fixed-width right column, top aligned.
+    logo_html = ''
+    if meta.get('include_logo', True) and LOGO_PATH.exists():
+        logo_html = ('<div style="margin-bottom:6pt;">'
+                     '<img src="%s" width="112" height="40"/></div>'
                      % _esc(str(LOGO_PATH)))
-    # Title centered on the page: logo on the left, a matching empty cell on
-    # the right so the middle title cell is optically centered.
-    title_row = (
-        '<table width="100%%"><tr>'
-        '<td width="130" valign="middle">%s</td>'
-        '<td valign="middle" align="center">'
-        '<h1>PDF Security Analysis Report</h1></td>'
-        '<td width="130"></td>'
-        '</tr></table>'
-        % logo_cell
-    )
-    # Compact risk badge, centered under the title.
     badge = _score_badge(risk, compact=True)
-    badge_row = ''
-    if badge:
-        badge_row = ('<table width="100%%"><tr><td></td>'
-                     '<td width="140">%s</td><td></td></tr></table>' % badge)
+    badge_cell = ('<td width="140" valign="top" align="right">%s</td>' % badge
+                  if badge else '<td width="140"></td>')
     return (
+        '<table width="100%%"><tr>'
+        '<td valign="top">'
         '%s'
-        '<p class="subtitle" style="text-align:center;">'
-        '%s &nbsp;&middot;&nbsp; %s UTC</p>'
+        '<h1>PDF Security Analysis Report</h1>'
+        '<p class="subtitle">%s &nbsp;&middot;&nbsp; %s UTC</p>'
+        '</td>'
         '%s'
-        % (title_row,
+        '</tr></table>'
+        % (logo_html,
            _fmt(Path(meta['scanned_path']).name, 120), _esc(meta['timestamp']),
-           badge_row)
+           badge_cell)
     )
 
 
@@ -277,13 +270,14 @@ def _section_risk(risk):
             reason_html = '<span class="empty">No indicators</span>'
         rows.append([
             '<b>%s</b>' % _esc(label),
-            '%s / %s' % (_esc(category['score']), _esc(category['max'])),
+            '%s&nbsp;/&nbsp;%s'
+            % (_esc(category['score']), _esc(category['max'])),
             _risk_bar(category['score'], category['max']),
             reason_html,
         ])
     parts.append(_grid_table(
         ["Category", "Score", "", "Indicators"], rows,
-        widths=["90", "42", "70", None]
+        widths=["90", "52", "70", None]
     ))
     return ''.join(parts)
 

@@ -3,6 +3,8 @@ import re
 import logging
 import os
 
+from .utils import build_xref_object_cache
+
 
 MAX_JS_CONTENT_SIZE = 50000
 PREVIEW_CONTENT_SIZE = 500
@@ -46,30 +48,27 @@ MEDIUM_SEVERITY_KEYWORDS = frozenset([
     'app.launchURL', 'app.execMenuItem', 'Collab.storeData'
 ])
 
-def extract_javascript_from_pdf(pdf_path, validate_pdf_file=None):
+def extract_javascript_from_pdf(pdf_path, validate_pdf_file=None, doc=None, xref_cache=None):
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return None
-    
-    # Capture original file timestamps
+
+    # Capture original file timestamps; when the caller passes an already-open
+    # document it owns opening, closing and timestamp restoration
     original_stats = None
-    try:
-        original_stats = os.stat(pdf_path)
-    except Exception:
-        pass
+    if doc is None:
+        try:
+            original_stats = os.stat(pdf_path)
+        except Exception:
+            pass
 
     js_findings = JSFindings()
-    
+
     try:
-        with fitz.open(pdf_path) as doc:
-
-            _check_document_javascript(doc, js_findings)
-            _check_page_javascript(doc, js_findings)
-            _check_form_javascript(doc, js_findings)
-            _check_annotation_javascript(doc, js_findings)
-
-
-            if js_findings.javascript_sources:
-                js_findings.suspicious_patterns = _analyze_suspicious_patterns(js_findings.javascript_sources)
+        if doc is not None:
+            _scan_document_javascript(doc, js_findings, xref_cache)
+        else:
+            with fitz.open(pdf_path) as opened_doc:
+                _scan_document_javascript(opened_doc, js_findings, xref_cache)
 
     except Exception as e:
         logger.error(f"Error extracting JavaScript from PDF: {str(e)}")
@@ -81,8 +80,18 @@ def extract_javascript_from_pdf(pdf_path, validate_pdf_file=None):
                 os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
             except Exception:
                 pass
-    
+
     return js_findings.to_dict()
+
+
+def _scan_document_javascript(doc, js_findings, xref_cache=None):
+    _check_document_javascript(doc, js_findings, xref_cache)
+    _check_page_javascript(doc, js_findings)
+    _check_form_javascript(doc, js_findings)
+    _check_annotation_javascript(doc, js_findings, xref_cache)
+
+    if js_findings.javascript_sources:
+        js_findings.suspicious_patterns = _analyze_suspicious_patterns(js_findings.javascript_sources)
 
 
 class JSFindings:
@@ -136,27 +145,25 @@ class JSFindings:
         }
 
 # search for JavaScript in document objects, labeling open actions separately
-def _check_document_javascript(doc, findings):
+def _check_document_javascript(doc, findings, xref_cache=None):
     try:
+        entries = xref_cache if xref_cache is not None else build_xref_object_cache(doc)
+        for xref_num, (obj, error) in entries.items():
+            if error is not None:
+                logger.debug(f"Error checking xref {xref_num}: {error}")
+                findings.add_error(f"XRef {xref_num} error: {error}")
+                continue
 
-        xref_length = doc.xref_length()
-        for xref_num in range(1, xref_length):
-            try:
-                obj = doc.xref_object(xref_num)
-
-                if "/JavaScript" in obj or "/JS" in obj:
-                    js_content = _extract_js_from_object(doc, obj, xref_num)
-                    if js_content:
-                        if "/OpenAction" in obj:
-                            source = "Open Action"
-                            location = f"Document Open Action (XRef {xref_num})"
-                        else:
-                            source = "Document Catalog"
-                            location = f"XRef {xref_num}"
-                        findings.add_javascript(source, location, js_content, js_content)
-            except Exception as e:
-                logger.debug(f"Error checking xref {xref_num}: {str(e)}")
-                findings.add_error(f"XRef {xref_num} error: {str(e)}")
+            if "/JavaScript" in obj or "/JS" in obj:
+                js_content = _extract_js_from_object(doc, obj, xref_num)
+                if js_content:
+                    if "/OpenAction" in obj:
+                        source = "Open Action"
+                        location = f"Document Open Action (XRef {xref_num})"
+                    else:
+                        source = "Document Catalog"
+                        location = f"XRef {xref_num}"
+                    findings.add_javascript(source, location, js_content, js_content)
 
     except Exception as e:
         findings.add_error(f"Document JavaScript check error: {str(e)}")
@@ -238,7 +245,7 @@ def _check_form_javascript(doc, findings):
         findings.add_error(f"Form JavaScript check error: {str(e)}")
 
 # search for JavaScript in the annotations
-def _check_annotation_javascript(doc, findings):
+def _check_annotation_javascript(doc, findings, xref_cache=None):
     try:
         for page_num, page in enumerate(doc):
             try:
@@ -252,7 +259,10 @@ def _check_annotation_javascript(doc, findings):
                         # not in a dedicated annotation type, so inspect the raw object
                         xref = annot.xref
                         if xref:
-                            obj_str = doc.xref_object(xref)
+                            if xref_cache is not None:
+                                obj_str = xref_cache.get(xref, (None, None))[0] or ""
+                            else:
+                                obj_str = doc.xref_object(xref)
                             if '/JavaScript' in obj_str or '/JS' in obj_str:
                                 js_content = _extract_js_from_object(doc, obj_str, xref)
                                 findings.add_javascript(

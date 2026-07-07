@@ -10,6 +10,8 @@ from pathlib import Path
 
 import fitz
 
+from .utils import build_xref_object_cache
+
 logger = logging.getLogger(__name__)
 
 MAX_EXTRACTION_ERRORS = 10
@@ -189,18 +191,15 @@ def _collect_annotation_attachments(doc, findings, include_data):
             findings.embedded_files.append(entry)
 
 
-def _find_hidden_streams(doc, findings, include_data):
+def _find_hidden_streams(doc, findings, include_data, xref_cache=None):
     # Streams referenced from any /EF dictionary are legitimate attachments;
     # /EmbeddedFile streams outside that set are hidden or orphaned payloads.
     referenced = set()
     ef_dict_xrefs = set()
     embedded_stream_xrefs = []
 
-    for xref_num in range(1, doc.xref_length()):
-        try:
-            obj = doc.xref_object(xref_num)
-        except Exception:
-            continue
+    entries = xref_cache if xref_cache is not None else build_xref_object_cache(doc)
+    for xref_num, (obj, _error) in entries.items():
         if not obj:
             continue
         for ef_match in _EF_DICT_PATTERN.finditer(obj):
@@ -213,10 +212,7 @@ def _find_hidden_streams(doc, findings, include_data):
             embedded_stream_xrefs.append(xref_num)
 
     for ef_xref in ef_dict_xrefs:
-        try:
-            ef_obj = doc.xref_object(ef_xref)
-        except Exception:
-            continue
+        ef_obj, _error = entries.get(ef_xref, (None, None))
         if ef_obj:
             for ref in _INDIRECT_REF_PATTERN.findall(ef_obj):
                 referenced.add(int(ref))
@@ -241,22 +237,33 @@ def _find_hidden_streams(doc, findings, include_data):
         findings.hidden_streams.append(entry)
 
 
-def detect_embedded_files(pdf_path, validate_pdf_file=None, include_data=False):
+def _collect_from_document(doc, findings, include_data, xref_cache=None):
+    _collect_name_tree_attachments(doc, findings, include_data)
+    _collect_annotation_attachments(doc, findings, include_data)
+    _find_hidden_streams(doc, findings, include_data, xref_cache)
+
+
+def detect_embedded_files(pdf_path, validate_pdf_file=None, include_data=False,
+                          doc=None, xref_cache=None):
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return None
 
+    # When the caller passes an already-open document it owns opening,
+    # closing and timestamp restoration
     original_stats = None
-    try:
-        original_stats = os.stat(pdf_path)
-    except Exception:
-        pass
+    if doc is None:
+        try:
+            original_stats = os.stat(pdf_path)
+        except Exception:
+            pass
 
     findings = EmbeddedFindings()
     try:
-        with fitz.open(pdf_path) as doc:
-            _collect_name_tree_attachments(doc, findings, include_data)
-            _collect_annotation_attachments(doc, findings, include_data)
-            _find_hidden_streams(doc, findings, include_data)
+        if doc is not None:
+            _collect_from_document(doc, findings, include_data, xref_cache)
+        else:
+            with fitz.open(pdf_path) as opened_doc:
+                _collect_from_document(opened_doc, findings, include_data, xref_cache)
     except Exception as e:
         logger.error(f"Error detecting embedded files: {str(e)}")
         findings.add_error(f"General embedded file detection error: {str(e)}")
@@ -278,13 +285,17 @@ def _sanitize_filename(filename):
     return name or "unnamed_attachment"
 
 
-def extract_embedded_files(pdf_path, output_dir=None):
+def extract_embedded_files(pdf_path, output_dir=None, findings=None):
     """Extract detected attachments and hidden streams to disk.
+
+    `findings` may be a previous detect_embedded_files(..., include_data=True)
+    result, so the document is not parsed a second time.
 
     Returns a list of (saved_path, sha256) tuples. Files are written without
     execute permissions; handle them in an isolated environment.
     """
-    findings = detect_embedded_files(pdf_path, include_data=True)
+    if findings is None:
+        findings = detect_embedded_files(pdf_path, include_data=True)
     if not findings:
         return []
 

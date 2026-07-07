@@ -15,7 +15,7 @@ from .link_extractor import LinkExtractor, defang_url, extract_links, remove_pro
 from .metadata_analyzer import analyze_pdf_metadata, print_metadata
 from .qr_detector import detect_qr_codes, print_qr_findings, QR_SUPPORT, QR_UNAVAILABLE_MESSAGE
 from .report_generator import create_report, MAX_OPERATOR_NAME_LENGTH
-from .risk_scorer import compute_risk_score
+from .risk_scorer import analyze_pdf_for_risk
 from .structure_analyzer import analyze_structure, print_structure_findings
 from .utils import get_confirmation
 
@@ -126,18 +126,12 @@ def _qr_worker(pdf_path):
 
 
 def _risk_worker(pdf_path):
-    return compute_risk_score(
-        js_findings=extract_javascript_from_pdf(pdf_path),
-        structure_findings=analyze_structure(pdf_path),
-        embedded_findings=detect_embedded_files(pdf_path),
-        links=extract_links(pdf_path),
-        qr_findings=detect_qr_codes(pdf_path)
-    )
+    return analyze_pdf_for_risk(pdf_path)
 
 
-def _report_worker(pdf_path, defang, operator_name):
+def _report_worker(pdf_path, defang, operator_name, include_logo=True):
     report_path = create_report(pdf_path, check_virustotal=False, defang=defang,
-                                operator_name=operator_name)
+                                operator_name=operator_name, include_logo=include_logo)
     if not report_path:
         raise RuntimeError("report generation failed")
     return report_path
@@ -470,6 +464,8 @@ def bulk_report_generation(files):
 
     defang = get_confirmation("\nWould you like to defang URLs?")
 
+    include_logo = get_confirmation("\nWould you like to include the logo in the reports?")
+
     print(f"\nGenerating reports for {len(files)} files...")
     if check_vt:
         # VirusTotal calls share one API budget and are rate limited, so
@@ -480,10 +476,12 @@ def bulk_report_generation(files):
         for i, pdf_path in enumerate(files, 1):
             print(f"  [{i}/{len(files)}] {Path(pdf_path).name}...")
             report_path = create_report(pdf_path, check_virustotal=True, defang=defang,
-                                        operator_name=operator_name, link_checker=link_checker)
+                                        operator_name=operator_name, link_checker=link_checker,
+                                        include_logo=include_logo)
             results[pdf_path] = (report_path is not None, report_path or "report generation failed")
     else:
-        worker = partial(_report_worker, defang=defang, operator_name=operator_name)
+        worker = partial(_report_worker, defang=defang, operator_name=operator_name,
+                         include_logo=include_logo)
         results = _run_parallel(files, worker, use_processes=True)
 
     generated = 0

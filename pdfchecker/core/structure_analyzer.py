@@ -7,6 +7,8 @@ import re
 
 import fitz
 
+from .utils import build_xref_object_cache
+
 logger = logging.getLogger(__name__)
 
 MAX_LOCATIONS_PER_ANOMALY = 10
@@ -96,12 +98,11 @@ class StructureFindings:
         }
 
 
-def _scan_xref_objects(doc, findings):
-    for xref_num in range(1, doc.xref_length()):
-        try:
-            obj = doc.xref_object(xref_num)
-        except Exception as e:
-            logger.debug(f"Error reading xref {xref_num}: {str(e)}")
+def _scan_xref_objects(doc, findings, xref_cache=None):
+    entries = xref_cache if xref_cache is not None else build_xref_object_cache(doc)
+    for xref_num, (obj, error) in entries.items():
+        if error is not None:
+            logger.debug(f"Error reading xref {xref_num}: {error}")
             continue
         if not obj:
             continue
@@ -148,33 +149,43 @@ def _scan_raw_obfuscation(pdf_path, findings):
                          f"/{match.group(1).decode('ascii', errors='ignore')} -> /{decoded}")
 
 
-def analyze_structure(pdf_path, validate_pdf_file=None):
+def _scan_document_structure(doc, findings, xref_cache=None):
+    _scan_xref_objects(doc, findings, xref_cache)
+
+    if doc.is_encrypted:
+        findings.add("Encryption", "Info", "Document is encrypted")
+    if getattr(doc, 'is_repaired', False):
+        findings.add("Malformed Structure", "Medium",
+                     "Cross-reference structure was broken and required repair")
+    version_count = getattr(doc, 'version_count', 1)
+    if version_count and version_count > 1:
+        findings.add("Incremental Updates", "Low",
+                     f"Document contains {version_count} revisions "
+                     "(content may have changed after signing/review)")
+    if doc.page_count == 0:
+        findings.add("No Pages", "Medium", "Document declares zero pages")
+
+
+def analyze_structure(pdf_path, validate_pdf_file=None, doc=None, xref_cache=None):
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return None
 
+    # When the caller passes an already-open document it owns opening,
+    # closing and timestamp restoration
     original_stats = None
-    try:
-        original_stats = os.stat(pdf_path)
-    except Exception:
-        pass
+    if doc is None:
+        try:
+            original_stats = os.stat(pdf_path)
+        except Exception:
+            pass
 
     findings = StructureFindings()
     try:
-        with fitz.open(pdf_path) as doc:
-            _scan_xref_objects(doc, findings)
-
-            if doc.is_encrypted:
-                findings.add("Encryption", "Info", "Document is encrypted")
-            if getattr(doc, 'is_repaired', False):
-                findings.add("Malformed Structure", "Medium",
-                             "Cross-reference structure was broken and required repair")
-            version_count = getattr(doc, 'version_count', 1)
-            if version_count and version_count > 1:
-                findings.add("Incremental Updates", "Low",
-                             f"Document contains {version_count} revisions "
-                             "(content may have changed after signing/review)")
-            if doc.page_count == 0:
-                findings.add("No Pages", "Medium", "Document declares zero pages")
+        if doc is not None:
+            _scan_document_structure(doc, findings, xref_cache)
+        else:
+            with fitz.open(pdf_path) as opened_doc:
+                _scan_document_structure(opened_doc, findings, xref_cache)
 
         _scan_raw_obfuscation(pdf_path, findings)
 

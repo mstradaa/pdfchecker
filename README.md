@@ -6,7 +6,7 @@
 
 **PDF Security Checker** is a cross-platform tool designed to evaluate PDF files for security threats and extract forensic-value information. It detects malicious indicators through hash validation, embedded script analysis, and metadata inspection. Reports are generated with forensic integrity in mind, incorporating cryptographic proof and principles of reproducibility.
 
-You can find a sample of the generated report [here](https://github.com/Strateo/pdfchecker/blob/main/docs/Report_sample.pdf).
+You can find a sample of the generated report [here](https://github.com/Strateo/pdfchecker/blob/main/docs/report_sample.pdf).
 
 ## Features
 

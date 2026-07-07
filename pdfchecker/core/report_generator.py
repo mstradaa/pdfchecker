@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 from datetime import datetime, timezone
-from xhtml2pdf import pisa
+
+import fitz
+
 from .hash_checker import calculate_file_hashes, check_virustotal as check_vt_hash
 from .link_extractor import extract_links, defang_url, LinkExtractor
 from .metadata_analyzer import analyze_pdf_metadata
@@ -11,7 +13,7 @@ from .embedded_file_detector import detect_embedded_files
 from .qr_detector import detect_qr_codes, QR_UNAVAILABLE_MESSAGE
 from .risk_scorer import compute_risk_score
 from .config_manager import get_api_key, ConfigError
-from .utils import get_confirmation
+from .utils import get_confirmation, build_xref_object_cache
 from .report_html import build_report_html
 
 PDFCHECKER_VERSION = "1.0"
@@ -40,27 +42,39 @@ def analyze_pdf_once(pdf_path, validate_pdf_file=None):
         result.errors.append(f"Analysis error: {str(e)}")
         return result
 
-    # Each analysis is isolated so one failure does not lose the rest of
-    # the report
-    try:
-        result.metadata = analyze_pdf_metadata(
-            pdf_path, validate_pdf_file=validate_pdf_file, file_stats=original_stats
-        )
-    except Exception as e:
-        result.errors.append(f"Metadata analysis error: {str(e)}")
-
     try:
         result.hashes = calculate_file_hashes(pdf_path)
     except Exception as e:
         result.errors.append(f"Hash calculation error: {str(e)}")
 
+    # One open document and one xref sweep shared by every analysis; on
+    # failure the analyzers fall back to opening the file themselves and
+    # report their own errors
+    doc = None
+    xref_cache = None
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        doc = None
+    if doc is not None:
+        try:
+            xref_cache = build_xref_object_cache(doc)
+        except Exception:
+            xref_cache = None
+
+    # Each analysis is isolated so one failure does not lose the rest of
+    # the report
     content_analyses = [
-        ('links', lambda: extract_links(pdf_path)),
+        ('metadata', lambda: analyze_pdf_metadata(
+            pdf_path, validate_pdf_file=validate_pdf_file,
+            file_stats=original_stats, doc=doc)),
+        ('links', lambda: extract_links(pdf_path, doc=doc)),
         ('javascript', lambda: extract_javascript_from_pdf(
-            pdf_path, validate_pdf_file=validate_pdf_file)),
-        ('structure', lambda: analyze_structure(pdf_path)),
-        ('embedded', lambda: detect_embedded_files(pdf_path)),
-        ('qr', lambda: detect_qr_codes(pdf_path)),
+            pdf_path, validate_pdf_file=validate_pdf_file,
+            doc=doc, xref_cache=xref_cache)),
+        ('structure', lambda: analyze_structure(pdf_path, doc=doc, xref_cache=xref_cache)),
+        ('embedded', lambda: detect_embedded_files(pdf_path, doc=doc, xref_cache=xref_cache)),
+        ('qr', lambda: detect_qr_codes(pdf_path, doc=doc)),
     ]
     try:
         for attr, analysis in content_analyses:
@@ -69,6 +83,8 @@ def analyze_pdf_once(pdf_path, validate_pdf_file=None):
             except Exception as e:
                 result.errors.append(f"{attr} analysis error: {str(e)}")
     finally:
+        if doc is not None:
+            doc.close()
         if original_stats:
             try:
                 os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
@@ -156,7 +172,7 @@ def _check_url_virustotal(link_checker, url):
 # Gather everything the HTML template needs, running the VirusTotal lookups
 # (file hash first, then links, then QR URLs) against the shared call limit
 def _collect_report_data(pdf_path, analysis_result, check_virustotal, defang,
-                         operator_name, link_checker):
+                         operator_name, link_checker, include_logo=True):
     vt_file = None
     if check_virustotal and analysis_result.hashes:
         sha256 = analysis_result.hashes.get("SHA-256")
@@ -203,6 +219,7 @@ def _collect_report_data(pdf_path, analysis_result, check_virustotal, defang,
             "operator": operator_name,
             "vt_enabled": check_virustotal,
             "defang": defang,
+            "include_logo": include_logo,
         },
         "risk": analysis_result.risk,
         "hashes": analysis_result.hashes,
@@ -219,8 +236,12 @@ def _collect_report_data(pdf_path, analysis_result, check_virustotal, defang,
 
 
 def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=None,
-                  validate_pdf_file=None, link_checker=None):
+                  validate_pdf_file=None, link_checker=None, include_logo=True):
     try:
+        # Deferred import: xhtml2pdf pulls in reportlab and is slow to load,
+        # and only this function needs it
+        from xhtml2pdf import pisa
+
         if operator_name and len(operator_name) > MAX_OPERATOR_NAME_LENGTH:
             operator_name = operator_name[:MAX_OPERATOR_NAME_LENGTH-3] + "..."
 
@@ -252,7 +273,7 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
 
         report_data = _collect_report_data(
             pdf_path, analysis_result, check_virustotal, defang,
-            operator_name, link_checker
+            operator_name, link_checker, include_logo
         )
         report_html = build_report_html(report_data)
 
@@ -294,8 +315,11 @@ def main(pdf_path, validate_pdf_file=None):
 
     defang = get_confirmation("\nWould you like to defang URLs?")
 
+    include_logo = get_confirmation("\nWould you like to include the logo in the report?")
+
     print(f"\nGenerating report for {pdf_path}...")
-    report_path = create_report(pdf_path, check_vt, defang, operator_name, validate_pdf_file=validate_pdf_file)
+    report_path = create_report(pdf_path, check_vt, defang, operator_name,
+                                validate_pdf_file=validate_pdf_file, include_logo=include_logo)
 
     if report_path:
         print(f"\nReport generated successfully: {report_path}")

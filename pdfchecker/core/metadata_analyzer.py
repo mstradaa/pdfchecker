@@ -329,23 +329,23 @@ def _get_document_id(doc):
         logger.debug(f"Error getting document ID: {str(e)}")
         return "Not available"
 
-def analyze_pdf_metadata(pdf_path, validate_pdf_file=None, file_stats=None):
+def analyze_pdf_metadata(pdf_path, validate_pdf_file=None, file_stats=None, doc=None):
     local_file_stats = file_stats  # Use provided stats if available
     if local_file_stats is None:
         try:
             local_file_stats = os.stat(pdf_path) # Fetch fresh stats *now*
         except FileNotFoundError:
             logger.error(f"File not found: {pdf_path}")
-            return None 
+            return None
         except Exception as e:
             logger.warning(f"Could not get initial file system attributes for {pdf_path}: {str(e)}. Proceeding with caution.")
             pass # local_file_stats remains None if error other than FileNotFoundError
 
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return None
-    
+
     result = {
-        "file_system": get_file_system_attributes(pdf_path, local_file_stats), 
+        "file_system": get_file_system_attributes(pdf_path, local_file_stats),
         "document_info": {},
         "structural_info": {},
         "page_info": {},
@@ -354,90 +354,97 @@ def analyze_pdf_metadata(pdf_path, validate_pdf_file=None, file_stats=None):
         "security_info": {},
         "additional_properties": {}
     }
-    
+
     try:
-        with fitz.open(pdf_path) as doc:
-            metadata = doc.metadata
-            processed_metadata = dict(metadata)
-            for date_field in ['creationDate', 'modDate']:
-                if date_field in processed_metadata:
-                    parsed_date = _parse_pdf_date(processed_metadata[date_field])
-                    if parsed_date:
-                        processed_metadata[date_field] = parsed_date
-            
-            result["document_info"] = {k: v for k, v in processed_metadata.items() if v}
-            
-            xmp_metadata = None
-            try:
-                xmp_metadata = doc.get_xml_metadata()
-            except Exception as e:
-                logger.debug(f"Failed to get XMP metadata: {str(e)}")
-            
-            format_info = detect_pdf_format(doc, xmp_metadata)
-            
-            is_encrypted = safe_get_attr(doc, "is_encrypted")
-            permissions = safe_get_attr(doc, "permissions")
-            
-            structural_info = {
-                "page_count": len(doc),
-                "is_encrypted": is_encrypted,
-                "is_pdfa": format_info["is_pdfa"],
-                "is_pdfx": format_info["is_pdfx"],
-                "file_format": format_info["format"],
-                "pdf_version": format_info["version"],
-                "permissions": get_human_readable_pdf_permissions(permissions)
-            }
-            
-            if format_info["is_pdfa"] and format_info["pdfa_version"]:
-                structural_info["pdfa_version"] = format_info["pdfa_version"]
-                if format_info.get("pdfa_revision"):
-                    structural_info["pdfa_revision"] = format_info["pdfa_revision"]
-            if format_info["is_pdfx"] and format_info["pdfx_version"]:
-                structural_info["pdfx_version"] = format_info["pdfx_version"]
-                
-            result["structural_info"] = structural_info
-            
-            page_analysis = _analyze_pages_combined(doc)
-            
-            result["page_info"] = page_analysis["first_page_info"]
-            
-            has_outline = bool(safe_get_attr(doc, "get_toc", []))
-            result["document_structure"] = {
-                "has_outline": has_outline,
-                "has_bookmarks": has_outline,
-                "has_form_fields": page_analysis["has_form_fields"]
-            }
-            
-            content_info = {
-                "has_images": page_analysis["has_images"],
-                "has_text": page_analysis["has_text"],
-                "has_javascript": page_analysis["has_javascript"]
-            }
-            
-            result["content_info"] = content_info
-            
-            # safe_get_attr returns a truthy "Not available" string on failure
-            if is_encrypted is True:
-                result["security_info"] = {
-                    "encryption_method": metadata.get("encryption", "Not available"),
-                    "permissions": get_human_readable_pdf_permissions(permissions)
-                }
-            
-            result["additional_properties"] = {
-                "document_id": _get_document_id(doc),
-                "language": metadata.get("language", "Not available"),
-                "page_mode": safe_get_attr(doc, "pagemode", "Not available"),
-                "page_layout": safe_get_attr(doc, "pagelayout", "Not available"),
-                "is_linearized": safe_get_attr(doc, "is_fast_webaccess", False),
-                "is_repaired": safe_get_attr(doc, "is_repaired", False),
-                "needs_password": safe_get_attr(doc, "needs_pass", False),
-                "version_count": safe_get_attr(doc, "version_count", 0)
-            }
-            return result
-            
+        # A caller running several analyses may pass its already-open document
+        if doc is not None:
+            return _populate_document_metadata(doc, result)
+        with fitz.open(pdf_path) as opened_doc:
+            return _populate_document_metadata(opened_doc, result)
+
     except Exception as e:
         logger.error(f"Error analyzing PDF: {str(e)}")
         return None
+
+
+def _populate_document_metadata(doc, result):
+    metadata = doc.metadata
+    processed_metadata = dict(metadata)
+    for date_field in ['creationDate', 'modDate']:
+        if date_field in processed_metadata:
+            parsed_date = _parse_pdf_date(processed_metadata[date_field])
+            if parsed_date:
+                processed_metadata[date_field] = parsed_date
+    
+    result["document_info"] = {k: v for k, v in processed_metadata.items() if v}
+    
+    xmp_metadata = None
+    try:
+        xmp_metadata = doc.get_xml_metadata()
+    except Exception as e:
+        logger.debug(f"Failed to get XMP metadata: {str(e)}")
+    
+    format_info = detect_pdf_format(doc, xmp_metadata)
+    
+    is_encrypted = safe_get_attr(doc, "is_encrypted")
+    permissions = safe_get_attr(doc, "permissions")
+    
+    structural_info = {
+        "page_count": len(doc),
+        "is_encrypted": is_encrypted,
+        "is_pdfa": format_info["is_pdfa"],
+        "is_pdfx": format_info["is_pdfx"],
+        "file_format": format_info["format"],
+        "pdf_version": format_info["version"],
+        "permissions": get_human_readable_pdf_permissions(permissions)
+    }
+    
+    if format_info["is_pdfa"] and format_info["pdfa_version"]:
+        structural_info["pdfa_version"] = format_info["pdfa_version"]
+        if format_info.get("pdfa_revision"):
+            structural_info["pdfa_revision"] = format_info["pdfa_revision"]
+    if format_info["is_pdfx"] and format_info["pdfx_version"]:
+        structural_info["pdfx_version"] = format_info["pdfx_version"]
+        
+    result["structural_info"] = structural_info
+    
+    page_analysis = _analyze_pages_combined(doc)
+    
+    result["page_info"] = page_analysis["first_page_info"]
+    
+    has_outline = bool(safe_get_attr(doc, "get_toc", []))
+    result["document_structure"] = {
+        "has_outline": has_outline,
+        "has_bookmarks": has_outline,
+        "has_form_fields": page_analysis["has_form_fields"]
+    }
+    
+    content_info = {
+        "has_images": page_analysis["has_images"],
+        "has_text": page_analysis["has_text"],
+        "has_javascript": page_analysis["has_javascript"]
+    }
+    
+    result["content_info"] = content_info
+    
+    # safe_get_attr returns a truthy "Not available" string on failure
+    if is_encrypted is True:
+        result["security_info"] = {
+            "encryption_method": metadata.get("encryption", "Not available"),
+            "permissions": get_human_readable_pdf_permissions(permissions)
+        }
+    
+    result["additional_properties"] = {
+        "document_id": _get_document_id(doc),
+        "language": metadata.get("language", "Not available"),
+        "page_mode": safe_get_attr(doc, "pagemode", "Not available"),
+        "page_layout": safe_get_attr(doc, "pagelayout", "Not available"),
+        "is_linearized": safe_get_attr(doc, "is_fast_webaccess", False),
+        "is_repaired": safe_get_attr(doc, "is_repaired", False),
+        "needs_password": safe_get_attr(doc, "needs_pass", False),
+        "version_count": safe_get_attr(doc, "version_count", 0)
+    }
+    return result
 
 def print_metadata(metadata):
     if not metadata:

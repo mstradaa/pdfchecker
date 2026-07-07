@@ -43,30 +43,44 @@ class LinkExtractor:
             self._api_initialized = True
             return False
     
-    def extract_links_from_pdf(self, pdf_path: str) -> List[str]:
+    @staticmethod
+    def _collect_page_links(doc) -> List[str]:
         links = []
-        doc = None
-        original_stats = None
-        try:
-            # Capture original file timestamps
-            original_stats = os.stat(pdf_path)
-            doc = fitz.open(pdf_path)
-            for page in doc:
-                link_list = page.get_links()
-                for link in link_list:
-                    if link["kind"] == fitz.LINK_URI:
-                        links.append(link["uri"])
-        except Exception as e:
-            print(f"Error extracting links: {str(e)}")
-        finally:
-            if doc:
-                doc.close()
-            if original_stats:
-                try:
-                    os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-                except Exception:
-                    pass
-        
+        for page in doc:
+            link_list = page.get_links()
+            for link in link_list:
+                if link["kind"] == fitz.LINK_URI:
+                    links.append(link["uri"])
+        return links
+
+    def extract_links_from_pdf(self, pdf_path: str, doc=None) -> List[str]:
+        # When the caller passes an already-open document it owns opening,
+        # closing and timestamp restoration
+        links = []
+        if doc is not None:
+            try:
+                links = self._collect_page_links(doc)
+            except Exception as e:
+                print(f"Error extracting links: {str(e)}")
+        else:
+            opened_doc = None
+            original_stats = None
+            try:
+                # Capture original file timestamps
+                original_stats = os.stat(pdf_path)
+                opened_doc = fitz.open(pdf_path)
+                links = self._collect_page_links(opened_doc)
+            except Exception as e:
+                print(f"Error extracting links: {str(e)}")
+            finally:
+                if opened_doc:
+                    opened_doc.close()
+                if original_stats:
+                    try:
+                        os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
+                    except Exception:
+                        pass
+
         seen = set()
         unique_links = []
         for link in links:
@@ -237,10 +251,10 @@ def main(pdf_path: str, defanged: bool = False, validate_pdf_file=None):
     finally:
         extractor.reset()
 
-def extract_links(pdf_path: str) -> List[str]:
+def extract_links(pdf_path: str, doc=None) -> List[str]:
     extractor = LinkExtractor()
     try:
-        return extractor.extract_links_from_pdf(pdf_path)
+        return extractor.extract_links_from_pdf(pdf_path, doc=doc)
     finally:
         extractor.reset()
 

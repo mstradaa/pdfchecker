@@ -1,7 +1,17 @@
 # Risk scoring: combines the findings of the individual analysis modules
 # (JavaScript, structure, embedded files, links, QR codes) into a single
 # weighted 0-100 score with a per-category breakdown, for fast triage.
+import os
 import re
+
+import fitz
+
+from .embedded_file_detector import detect_embedded_files
+from .javascript_detector import extract_javascript_from_pdf
+from .link_extractor import extract_links
+from .qr_detector import detect_qr_codes
+from .structure_analyzer import analyze_structure
+from .utils import build_xref_object_cache
 
 CATEGORY_WEIGHTS = {
     "javascript": 30,
@@ -232,6 +242,48 @@ def compute_risk_score(js_findings=None, structure_findings=None,
         "categories": categories,
         "adjustments": adjustments
     }
+
+
+def analyze_pdf_for_risk(pdf_path):
+    """Run the five risk analyses sharing one open document and one xref
+    sweep instead of re-parsing the file once per analysis."""
+    # Capture timestamps before opening so they can be restored afterwards
+    original_stats = None
+    try:
+        original_stats = os.stat(pdf_path)
+    except Exception:
+        pass
+
+    # On failure the analyzers fall back to opening the file themselves and
+    # report their own errors
+    doc = None
+    xref_cache = None
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        doc = None
+    if doc is not None:
+        try:
+            xref_cache = build_xref_object_cache(doc)
+        except Exception:
+            xref_cache = None
+
+    try:
+        return compute_risk_score(
+            js_findings=extract_javascript_from_pdf(pdf_path, doc=doc, xref_cache=xref_cache),
+            structure_findings=analyze_structure(pdf_path, doc=doc, xref_cache=xref_cache),
+            embedded_findings=detect_embedded_files(pdf_path, doc=doc, xref_cache=xref_cache),
+            links=extract_links(pdf_path, doc=doc),
+            qr_findings=detect_qr_codes(pdf_path, doc=doc)
+        )
+    finally:
+        if doc is not None:
+            doc.close()
+        if original_stats:
+            try:
+                os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
+            except Exception:
+                pass
 
 
 def print_risk_assessment(assessment, max_reasons_per_category=5):

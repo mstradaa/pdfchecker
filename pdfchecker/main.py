@@ -24,8 +24,8 @@ from .core.embedded_file_detector import (detect_embedded_files, extract_embedde
 from .core.structure_analyzer import analyze_structure, print_structure_findings
 from .core.qr_detector import (detect_qr_codes, print_qr_findings,
                                QR_SUPPORT, QR_UNAVAILABLE_MESSAGE)
-from .core.link_extractor import LinkExtractor, defang_url, extract_links
-from .core.risk_scorer import compute_risk_score, print_risk_assessment
+from .core.link_extractor import LinkExtractor, defang_url
+from .core.risk_scorer import analyze_pdf_for_risk, print_risk_assessment
 from .core.report_generator import main as report_generator_main
 from .core.utils import get_confirmation
 
@@ -235,7 +235,10 @@ def handle_javascript_analysis(pdf_file):
     print_javascript_findings(js_findings)
 
 def handle_embedded_analysis(pdf_file):
-    findings = detect_embedded_files(pdf_file, validate_pdf_file=validate_pdf_file)
+    # include_data=True so a later extraction reuses these findings instead
+    # of parsing the document a second time
+    findings = detect_embedded_files(pdf_file, validate_pdf_file=validate_pdf_file,
+                                     include_data=True)
     if findings is None:
         return
     print_embedded_findings(findings)
@@ -246,7 +249,7 @@ def handle_embedded_analysis(pdf_file):
     print("\nWARNING: Embedded files may be malicious. Only extract them in an "
           "isolated analysis environment.")
     if get_confirmation("Extract embedded files to disk?"):
-        saved = extract_embedded_files(pdf_file)
+        saved = extract_embedded_files(pdf_file, findings=findings)
         if saved:
             print(f"\n{len(saved)} file(s) extracted (owner read/write only, not executable):")
             for path, sha256 in saved:
@@ -310,13 +313,7 @@ def handle_risk_score(pdf_file):
         return
 
     print(f"\nComputing risk score for {pdf_file}...")
-    assessment = compute_risk_score(
-        js_findings=extract_javascript_from_pdf(pdf_file),
-        structure_findings=analyze_structure(pdf_file),
-        embedded_findings=detect_embedded_files(pdf_file),
-        links=extract_links(pdf_file),
-        qr_findings=detect_qr_codes(pdf_file)
-    )
+    assessment = analyze_pdf_for_risk(pdf_file)
     print_risk_assessment(assessment)
     if not QR_SUPPORT:
         print(f"\nNote: {QR_UNAVAILABLE_MESSAGE}")
