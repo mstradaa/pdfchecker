@@ -29,6 +29,9 @@ _MAGIC_SIGNATURES = [
     (b'MZ', "Windows executable (PE)", True),
     (b'\x7fELF', "Linux executable (ELF)", True),
     (b'\xcf\xfa\xed\xfe', "macOS executable (Mach-O)", True),
+    (b'\xce\xfa\xed\xfe', "macOS executable (Mach-O)", True),
+    (b'\xfe\xed\xfa\xcf', "macOS executable (Mach-O)", True),
+    (b'\xfe\xed\xfa\xce', "macOS executable (Mach-O)", True),
     (b'\xca\xfe\xba\xbe', "Java class / universal binary", True),
     (b'%PDF', "PDF document", False),
     (b'PK\x03\x04', "ZIP archive (or Office/JAR container)", False),
@@ -39,6 +42,7 @@ _MAGIC_SIGNATURES = [
 
 _INDIRECT_REF_PATTERN = re.compile(r'(\d+)\s+0\s+R')
 _EF_DICT_PATTERN = re.compile(r'/EF\s*<<(.*?)>>', re.DOTALL)
+_EF_INDIRECT_PATTERN = re.compile(r'/EF\s+(\d+)\s+0\s+R')
 _EMBEDDED_FILE_KEY_PATTERN = re.compile(r'/EmbeddedFile(?![0-9A-Za-z])')
 
 
@@ -189,6 +193,7 @@ def _find_hidden_streams(doc, findings, include_data):
     # Streams referenced from any /EF dictionary are legitimate attachments;
     # /EmbeddedFile streams outside that set are hidden or orphaned payloads.
     referenced = set()
+    ef_dict_xrefs = set()
     embedded_stream_xrefs = []
 
     for xref_num in range(1, doc.xref_length()):
@@ -201,8 +206,20 @@ def _find_hidden_streams(doc, findings, include_data):
         for ef_match in _EF_DICT_PATTERN.finditer(obj):
             for ref in _INDIRECT_REF_PATTERN.findall(ef_match.group(1)):
                 referenced.add(int(ref))
+        # /EF may also be an indirect reference to the dictionary itself
+        for ref in _EF_INDIRECT_PATTERN.findall(obj):
+            ef_dict_xrefs.add(int(ref))
         if _EMBEDDED_FILE_KEY_PATTERN.search(obj) and doc.xref_is_stream(xref_num):
             embedded_stream_xrefs.append(xref_num)
+
+    for ef_xref in ef_dict_xrefs:
+        try:
+            ef_obj = doc.xref_object(ef_xref)
+        except Exception:
+            continue
+        if ef_obj:
+            for ref in _INDIRECT_REF_PATTERN.findall(ef_obj):
+                referenced.add(int(ref))
 
     for xref_num in embedded_stream_xrefs:
         if xref_num in referenced:

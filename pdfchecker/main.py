@@ -1,21 +1,33 @@
 import argparse
 from pathlib import Path
 import os
-from core import bulk_processor, config_manager
-from core.config_manager import ConfigError, KeyringError
-from core.hash_checker import main as hash_checker_main
-from core.link_extractor import main as link_extractor_main
-from core.metadata_analyzer import analyze_pdf_metadata, print_metadata
-from core.javascript_detector import extract_javascript_from_pdf, print_javascript_findings
-from core.embedded_file_detector import (detect_embedded_files, extract_embedded_files,
-                                         print_embedded_findings)
-from core.structure_analyzer import analyze_structure, print_structure_findings
-from core.qr_detector import (detect_qr_codes, print_qr_findings,
-                              QR_SUPPORT, QR_UNAVAILABLE_MESSAGE)
-from core.link_extractor import LinkExtractor, defang_url, extract_links
-from core.risk_scorer import compute_risk_score, print_risk_assessment
-from core.report_generator import main as report_generator_main
-from core.utils import get_confirmation
+
+if __package__ in (None, ""):
+    # Executed as a plain script (python pdfchecker/main.py): register the
+    # parent directory as package root so the relative imports below resolve
+    # the same way they do for the installed package
+    import importlib
+    import sys
+    _package_dir = Path(__file__).resolve().parent
+    sys.path.insert(0, str(_package_dir.parent))
+    __package__ = _package_dir.name
+    importlib.import_module(__package__)
+
+from .core import bulk_processor, config_manager
+from .core.config_manager import ConfigError, KeyringError
+from .core.hash_checker import main as hash_checker_main
+from .core.link_extractor import main as link_extractor_main
+from .core.metadata_analyzer import analyze_pdf_metadata, print_metadata
+from .core.javascript_detector import extract_javascript_from_pdf, print_javascript_findings
+from .core.embedded_file_detector import (detect_embedded_files, extract_embedded_files,
+                                          print_embedded_findings)
+from .core.structure_analyzer import analyze_structure, print_structure_findings
+from .core.qr_detector import (detect_qr_codes, print_qr_findings,
+                               QR_SUPPORT, QR_UNAVAILABLE_MESSAGE)
+from .core.link_extractor import LinkExtractor, defang_url, extract_links
+from .core.risk_scorer import compute_risk_score, print_risk_assessment
+from .core.report_generator import main as report_generator_main
+from .core.utils import get_confirmation
 
 MAX_FILE_SIZE_MB = 100
 MAX_INPUT_LENGTH = 1000

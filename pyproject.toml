@@ -7,6 +7,7 @@ dependencies = [
     "PyMuPDF>=1.23.8",
     "requests>=2.31.0",
     "keyring>=24.3.0",
+    "xhtml2pdf>=0.2.11",
 ]
 
 [project.optional-dependencies]
@@ -16,6 +17,9 @@ qr = [
     "numpy>=1.24",
 ]
 
+[project.scripts]
+pdfchecker = "pdfchecker.main:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -24,4 +28,4 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["source"] 
+packages = ["pdfchecker"] 

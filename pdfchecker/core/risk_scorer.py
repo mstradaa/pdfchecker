@@ -106,7 +106,10 @@ def _score_structure(structure_findings):
     for anomaly in structure_findings.get("anomalies", []):
         severity_points = _STRUCTURE_SEVERITY_POINTS.get(anomaly.get("severity"), 0)
         if severity_points:
-            points += severity_points
+            # Repeated instances of the same anomaly add weight, capped at
+            # double the base points so one noisy type cannot dominate
+            count = max(anomaly.get("count", 1), 1)
+            points += min(severity_points * count, severity_points * 2)
             reasons.append(f"[{anomaly.get('severity')}] {anomaly.get('type')} "
                            f"(x{anomaly.get('count', 1)})")
     return points, reasons

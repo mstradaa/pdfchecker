@@ -75,6 +75,13 @@ class LinkExtractor:
                 unique_links.append(link)
         return unique_links
     
+    # Reserve one call from the shared budget; False when the limit is exhausted
+    def consume_api_call(self) -> bool:
+        if self.api_calls_made >= self.api_limit:
+            return False
+        self.api_calls_made += 1
+        return True
+
     def check_link_virustotal(self, url: str) -> Optional[Dict]:
         if url in self.checked_urls:
             return None
@@ -102,11 +109,14 @@ class LinkExtractor:
 
             analysis_id = response.json()["data"]["id"]
             result_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
-            # URL analyses are asynchronous: poll until the scan completes or we give up
+            # URL analyses are asynchronous: poll until the scan completes, the
+            # API call budget runs out, or we give up
             result = None
             for attempt in range(ANALYSIS_MAX_POLLS):
+                if not self.consume_api_call():
+                    print("   API call limit reached while waiting for analysis results.")
+                    break
                 response = requests.get(result_url, headers=headers, timeout=REQUEST_TIMEOUT, verify=True)
-                self.api_calls_made += 1
                 response.raise_for_status()
                 result = response.json()
                 status = result.get("data", {}).get("attributes", {}).get("status")

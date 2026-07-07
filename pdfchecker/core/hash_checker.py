@@ -1,8 +1,8 @@
 import hashlib
 import os
 import requests
-from core.config_manager import get_api_key
-from core.utils import get_confirmation
+from .config_manager import get_api_key
+from .utils import get_confirmation
 
 
 REQUEST_TIMEOUT = 30

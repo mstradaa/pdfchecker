@@ -49,7 +49,7 @@ You can find a sample of the generated report [here](https://github.com/Strateo/
 - **Bulk Triage**: In bulk mode, files are ranked by score so the riskiest surface first.
 
 ### 8. Report Generation
-- **Detailed PDF Reports**: Generates comprehensive reports covering every module above — risk score, hashes, links, metadata, JavaScript, embedded files, structural anomalies and QR codes.
+- **Detailed PDF Reports**: Generates comprehensive reports covering every module above: risk score, hashes, links, metadata, JavaScript, embedded files, structural anomalies and QR codes.
 - **Dual-Hash System**: Provides both the original PDF's hash and the final report's hash to ensure report integrity and support evidentiary standards.
 
 
@@ -65,9 +65,11 @@ Ensure you have Python 3.8 or higher installed along with the required dependenc
 git clone https://github.com/strateo/pdfchecker.git
 cd pdfchecker
 
-# Install 
+# Install (provides the `pdfchecker` command)
 pip install -e .
 ```
+
+The tool can also be run directly from the repository without installing: `python pdfchecker/main.py <options>`.
 
 ### Command-Line Interface
 
@@ -89,10 +91,10 @@ Every analysis option also accepts a folder path. When a folder is provided, PDF
 
 ```bash
 # Analyze a single PDF
-python source/main.py -m suspicious.pdf
+pdfchecker -m suspicious.pdf
 
 # Analyze every PDF in a folder (asks for confirmation first)
-python source/main.py -m ./samples/
+pdfchecker -m ./samples/
 ```
 
 Bulk mode behavior:
