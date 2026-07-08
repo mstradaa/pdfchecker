@@ -140,7 +140,7 @@ def _report_worker(pdf_path, defang, operator_name, include_logo=True):
 # Run worker over all files; returns {path: (ok, result_or_error_message)}.
 # Threads suit hashing (hashlib/file IO release the GIL); PyMuPDF is not
 # thread-safe, so fitz-based workers run in separate processes instead.
-def _run_parallel(files, worker, use_processes):
+def _run_parallel(files, worker, use_processes, process_initializer=apply_memory_guard):
     if len(files) == 1:
         try:
             return {files[0]: (True, worker(files[0]))}
@@ -152,7 +152,7 @@ def _run_parallel(files, worker, use_processes):
         max_workers = min(len(files), os.cpu_count() or 2, MAX_PROCESS_WORKERS)
         # Each PDF-parsing worker caps its own address space so a decompression
         # bomb aborts that one file instead of the whole run
-        executor_kwargs = {"initializer": apply_memory_guard}
+        executor_kwargs = {"initializer": process_initializer}
     else:
         executor_cls = ThreadPoolExecutor
         max_workers = min(len(files), MAX_HASH_THREADS)

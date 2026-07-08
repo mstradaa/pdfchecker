@@ -2,6 +2,7 @@ import argparse
 import getpass
 from pathlib import Path
 import os
+import sys
 
 if __package__ in (None, ""):
     # Executed as a plain script (python pdfchecker/main.py): register the
@@ -14,7 +15,7 @@ if __package__ in (None, ""):
     __package__ = _package_dir.name
     importlib.import_module(__package__)
 
-from .core import bulk_processor, config_manager
+from .core import bulk_processor, config_manager, json_output
 from .core.config_manager import ConfigError, KeyringError
 from .core.hash_checker import main as hash_checker_main
 from .core.link_extractor import main as link_extractor_main
@@ -204,6 +205,8 @@ def handle_pdf_analysis(args):
             # Cap this process's memory before parsing any untrusted PDF so a
             # decompression bomb aborts rather than exhausting the host
             apply_memory_guard()
+            if getattr(args, 'json', False):
+                sys.exit(json_output.run_json_analysis(arg_name, target))
             if Path(target).is_dir():
                 bulk_processor.run_bulk_analysis(
                     target, label, bulk_handler,
@@ -347,7 +350,9 @@ def create_argument_parser():
                       help='Compute a 0-100 risk score combining JavaScript, structure, embedded file, link and QR analysis, for a single PDF or all PDFs in a folder (bulk mode)')
     parser.add_argument('-r', '--report', metavar='PDF_FILE_OR_DIR',
                       help='Generate a comprehensive PDF report with hash, links, metadata, and JavaScript analysis, for a single PDF or all PDFs in a folder (bulk mode)')
-    
+    parser.add_argument('--json', action='store_true',
+                      help='Emit machine-readable JSON to stdout instead of interactive text (non-interactive: no VirusTotal checks, prompts, or file extraction)')
+
     vt_group = parser.add_argument_group('VirusTotal API Key Management')
     vt_group.add_argument('--set-api-key', action='store_true',
                          help='Set your VirusTotal API key (secure interactive prompt)')
@@ -369,7 +374,10 @@ def main():
     
     if handle_pdf_analysis(args):
         return
-    
+
+    if args.json:
+        parser.error("--json requires an analysis option (-hc/-l/-m/-js/-ef/-sa/-qr/-rs/-r)")
+
     parser.print_help()
 
 if __name__ == "__main__":
