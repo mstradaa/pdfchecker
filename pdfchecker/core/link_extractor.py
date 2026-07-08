@@ -1,10 +1,10 @@
 import fitz
-import requests
 import os
 import time
 from typing import List, Dict, Optional, Tuple, Set
 from .config_manager import get_api_key, get_api_limit
-from .utils import get_confirmation
+from .utils import (get_confirmation, http_request_json,
+                    HTTPStatusError, HTTPTimeoutError, HTTPNetworkError)
 
 REQUEST_TIMEOUT = 30
 ANALYSIS_POLL_INTERVAL = 3
@@ -108,20 +108,15 @@ class LinkExtractor:
         try:
             headers = {"x-apikey": self.api_key}
             submit_url = "https://www.virustotal.com/api/v3/urls"
-            response = requests.post(
-                submit_url, 
-                headers=headers, 
-                data={"url": url}, 
-                timeout=REQUEST_TIMEOUT, 
-                verify=True
-            )
+            submission = http_request_json(
+                submit_url, headers=headers, data={"url": url},
+                timeout=REQUEST_TIMEOUT)
             # The submission consumed quota regardless of what happens next, so
             # count it and mark the URL as checked before any later step can fail
             self.api_calls_made += 1
             self.checked_urls.add(url)
-            response.raise_for_status()
 
-            analysis_id = response.json()["data"]["id"]
+            analysis_id = submission["data"]["id"]
             result_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
             # URL analyses are asynchronous: poll until the scan completes, the
             # API call budget runs out, or we give up
@@ -130,21 +125,20 @@ class LinkExtractor:
                 if not self.consume_api_call():
                     print("   API call limit reached while waiting for analysis results.")
                     break
-                response = requests.get(result_url, headers=headers, timeout=REQUEST_TIMEOUT, verify=True)
-                response.raise_for_status()
-                result = response.json()
+                result = http_request_json(result_url, headers=headers,
+                                           timeout=REQUEST_TIMEOUT)
                 status = result.get("data", {}).get("attributes", {}).get("status")
                 if status == "completed":
                     break
                 if attempt < ANALYSIS_MAX_POLLS - 1:
                     time.sleep(ANALYSIS_POLL_INTERVAL)
             return result
-            
-        except requests.exceptions.Timeout:
+
+        except HTTPTimeoutError:
             print("VirusTotal request timed out. Please try again later.")
-        except requests.exceptions.HTTPError as e:
-            print(f"VirusTotal API error: HTTP {e.response.status_code}")
-        except requests.exceptions.RequestException:
+        except HTTPStatusError as e:
+            print(f"VirusTotal API error: HTTP {e.status}")
+        except HTTPNetworkError:
             print("Network error communicating with VirusTotal")
         except Exception:
             print("Unexpected error checking URL with VirusTotal")

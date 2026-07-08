@@ -17,7 +17,7 @@ from .qr_detector import detect_qr_codes, print_qr_findings, QR_SUPPORT, QR_UNAV
 from .report_generator import create_report, MAX_OPERATOR_NAME_LENGTH
 from .risk_scorer import analyze_pdf_for_risk
 from .structure_analyzer import analyze_structure, print_structure_findings
-from .utils import get_confirmation
+from .utils import get_confirmation, apply_memory_guard
 
 MAX_FILE_SIZE_MB = 100
 # fitz keeps whole documents in memory, so cap process workers to bound peak usage
@@ -150,13 +150,17 @@ def _run_parallel(files, worker, use_processes):
     if use_processes:
         executor_cls = ProcessPoolExecutor
         max_workers = min(len(files), os.cpu_count() or 2, MAX_PROCESS_WORKERS)
+        # Each PDF-parsing worker caps its own address space so a decompression
+        # bomb aborts that one file instead of the whole run
+        executor_kwargs = {"initializer": apply_memory_guard}
     else:
         executor_cls = ThreadPoolExecutor
         max_workers = min(len(files), MAX_HASH_THREADS)
+        executor_kwargs = {}
 
     results = {}
     total = len(files)
-    with executor_cls(max_workers=max_workers) as pool:
+    with executor_cls(max_workers=max_workers, **executor_kwargs) as pool:
         futures = {pool.submit(worker, path): path for path in files}
         for done, future in enumerate(as_completed(futures), 1):
             path = futures[future]

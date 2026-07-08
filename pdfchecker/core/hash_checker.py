@@ -1,8 +1,8 @@
 import hashlib
 import os
-import requests
 from .config_manager import get_api_key
-from .utils import get_confirmation
+from .utils import (get_confirmation, http_request_json,
+                    HTTPStatusError, HTTPTimeoutError, HTTPNetworkError)
 
 
 REQUEST_TIMEOUT = 30
@@ -42,22 +42,19 @@ def check_virustotal(hash_value, silent=False):
 
         headers = {"x-apikey": api_key}
         url = f"https://www.virustotal.com/api/v3/files/{hash_value}"
-        
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, verify=True)
-        response.raise_for_status()
-        
-        return response.json()
-        
-    except requests.exceptions.Timeout:
+
+        return http_request_json(url, headers=headers, timeout=REQUEST_TIMEOUT)
+
+    except HTTPTimeoutError:
         if not silent:
             print("VirusTotal request timed out. Please try again later.")
-    except requests.exceptions.HTTPError as e:
+    except HTTPStatusError as e:
         if not silent:
-            if e.response.status_code == 404:
+            if e.status == 404:
                 print("Hash not found in VirusTotal database.")
             else:
-                print(f"VirusTotal API error: HTTP {e.response.status_code}")
-    except requests.exceptions.RequestException:
+                print(f"VirusTotal API error: HTTP {e.status}")
+    except HTTPNetworkError:
         if not silent:
             print("Network error communicating with VirusTotal")
     except Exception:

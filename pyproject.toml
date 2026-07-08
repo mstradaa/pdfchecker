@@ -3,11 +3,13 @@ name = "pdfchecker"
 version = "1.0.0"
 description = "A tool for analyzing and checking the security of PDF files"
 requires-python = ">=3.8"
+# PyMuPDF parses untrusted PDFs (native MuPDF), so the floor is kept current
+# for upstream memory-safety fixes; it also renders the HTML report via
+# fitz.Story, so no separate HTML-to-PDF engine is needed. HTTP (VirusTotal)
+# uses the standard library, so requests is not a dependency.
 dependencies = [
-    "PyMuPDF>=1.23.8",
-    "requests>=2.31.0",
+    "PyMuPDF>=1.24.0",
     "keyring>=24.3.0",
-    "xhtml2pdf>=0.2.11",
 ]
 
 [project.optional-dependencies]

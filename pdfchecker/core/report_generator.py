@@ -14,10 +14,57 @@ from .qr_detector import detect_qr_codes, QR_UNAVAILABLE_MESSAGE
 from .risk_scorer import compute_risk_score
 from .config_manager import get_api_key, ConfigError
 from .utils import get_confirmation, build_xref_object_cache
-from .report_html import build_report_html
+from .report_html import build_report_html, build_footer_text, CSS, ASSETS_DIR
 
 PDFCHECKER_VERSION = "1.0"
 MAX_OPERATOR_NAME_LENGTH = 100
+
+# A4 page with the same margins the old CSS @page rule used (points)
+_PAGE_MARGIN = 46
+_BOTTOM_MARGIN = 58
+# Footer styling, sampled from the report's muted/border palette
+_FOOTER_TEXT_COLOR = (0x5b / 255, 0x65 / 255, 0x72 / 255)
+_FOOTER_RULE_COLOR = (0xd8 / 255, 0xdd / 255, 0xe3 / 255)
+
+
+def _render_html_to_pdf(body_html, meta, output_path):
+    """Render the report HTML to a PDF with PyMuPDF's Story engine and stamp a
+    page-numbered footer once the total page count is known."""
+    import io
+
+    mediabox = fitz.paper_rect("a4")
+    content = fitz.Rect(_PAGE_MARGIN, _PAGE_MARGIN,
+                        mediabox.x1 - _PAGE_MARGIN, mediabox.y1 - _BOTTOM_MARGIN)
+    # Images are resolved through an archive rooted at the assets directory, so
+    # the renderer never dereferences an absolute path from the HTML
+    archive = fitz.Archive(str(ASSETS_DIR)) if ASSETS_DIR.exists() else None
+
+    story = fitz.Story(html=body_html, user_css=CSS, archive=archive)
+    buffer = io.BytesIO()
+    writer = fitz.DocumentWriter(buffer)
+    more = 1
+    while more:
+        device = writer.begin_page(mediabox)
+        more, _ = story.place(content)
+        story.draw(device)
+        writer.end_page()
+    writer.close()
+
+    doc = fitz.open("pdf", buffer.getvalue())
+    try:
+        page_count = doc.page_count
+        footer_y = mediabox.y1 - 30
+        for index, page in enumerate(doc, 1):
+            page.draw_line(fitz.Point(_PAGE_MARGIN, footer_y - 6),
+                           fitz.Point(mediabox.x1 - _PAGE_MARGIN, footer_y - 6),
+                           color=_FOOTER_RULE_COLOR, width=0.6)
+            page.insert_text(fitz.Point(_PAGE_MARGIN, footer_y),
+                             build_footer_text(meta, index, page_count),
+                             fontsize=7.5, fontname="helv",
+                             color=_FOOTER_TEXT_COLOR)
+        doc.save(str(output_path))
+    finally:
+        doc.close()
 
 
 class PDFAnalysisResult:
@@ -238,10 +285,6 @@ def _collect_report_data(pdf_path, analysis_result, check_virustotal, defang,
 def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=None,
                   validate_pdf_file=None, link_checker=None, include_logo=True):
     try:
-        # Deferred import: xhtml2pdf pulls in reportlab and is slow to load,
-        # and only this function needs it
-        from xhtml2pdf import pisa
-
         if operator_name and len(operator_name) > MAX_OPERATOR_NAME_LENGTH:
             operator_name = operator_name[:MAX_OPERATOR_NAME_LENGTH-3] + "..."
 
@@ -276,12 +319,7 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
             operator_name, link_checker, include_logo
         )
         report_html = build_report_html(report_data)
-
-        with open(output_path, 'wb') as output_file:
-            status = pisa.CreatePDF(report_html, dest=output_file)
-        if status.err:
-            output_path.unlink(missing_ok=True)
-            raise RuntimeError("HTML to PDF conversion failed")
+        _render_html_to_pdf(report_html, report_data['meta'], output_path)
 
         return str(output_path)
 

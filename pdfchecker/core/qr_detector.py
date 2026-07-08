@@ -47,6 +47,10 @@ RENDER_DPI = 150
 MAX_QR_PAGES = 200
 MAX_PAYLOAD_LENGTH = 2000
 MAX_QR_ERRORS = 10
+# A page's media box can be enormous (up to ~200 inches per side) independent of
+# file size, so cap the rendered bitmap; the DPI is scaled down to stay within
+# this budget to keep a single crafted page from exhausting memory (~64 MB gray).
+MAX_RENDER_PIXELS = 64_000_000
 
 _URL_PATTERN = re.compile(r'^(?:[a-zA-Z][a-zA-Z0-9+.-]*://|www\.)', re.IGNORECASE)
 
@@ -55,8 +59,18 @@ def is_url_payload(payload):
     return bool(payload) and bool(_URL_PATTERN.match(payload.strip()))
 
 
+def _safe_render_dpi(page):
+    # Scale the DPI down for oversized pages so width*height stays within the
+    # pixel budget; normal-sized pages keep the full RENDER_DPI.
+    rect = page.rect
+    est_pixels = (rect.width / 72 * RENDER_DPI) * (rect.height / 72 * RENDER_DPI)
+    if est_pixels <= MAX_RENDER_PIXELS or est_pixels <= 0:
+        return RENDER_DPI
+    return max(1, int(RENDER_DPI * (MAX_RENDER_PIXELS / est_pixels) ** 0.5))
+
+
 def _decode_page(page, detector):
-    pix = page.get_pixmap(dpi=RENDER_DPI, colorspace=fitz.csGRAY, alpha=False)
+    pix = page.get_pixmap(dpi=_safe_render_dpi(page), colorspace=fitz.csGRAY, alpha=False)
     # pix.samples rows are padded to pix.stride bytes; crop to real width
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
 

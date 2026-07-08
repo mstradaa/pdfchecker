@@ -111,6 +111,8 @@ Bulk mode behavior:
 - `--show-api-key`: Show your current VirusTotal API key (double confirmation).
 - `--edit-api-limit`: View and edit the API call limit for VirusTotal (default value is set to 10 calls per single operation).
 
+The API key can also be supplied via the `PDFCHECKER_VT_API_KEY` (or `VT_API_KEY`) environment variable, which takes precedence over the stored key — useful on CI or headless machines without a system keychain. The API call limit is kept in a plain config file (`~/Library/Application Support/pdfchecker/config.json` on macOS, `%APPDATA%\pdfchecker` on Windows, `$XDG_CONFIG_HOME/pdfchecker` elsewhere).
+
 
 
 ## Security Considerations
@@ -124,7 +126,7 @@ Bulk mode behavior:
 - API communication is HTTPS-only with strict timeout enforcement.
 - Duplicate Call Prevention: Identical links within the same document are scanned only once to minimize redundant VirusTotal API usage (URLs with different paths or subdomains are treated as distinct and checked separately).
 - API key memory cleaning to avoid memory dumps or swap files. 
-- API keys are encrypted and stored using OS-native keychain utilities (Keychain, Credential manager, Gnome Keyring, KWallet).
+- API keys are encrypted and stored using OS-native keychain utilities (Keychain, Credential manager, Gnome Keyring, KWallet); insecure keyring backends (e.g. `keyrings.alt` plaintext storage) are rejected. An environment variable (`PDFCHECKER_VT_API_KEY`/`VT_API_KEY`) can be used instead on headless systems.
 
 ### Forensic Features
 - Dual-hash integrity: report includes original PDF hash and generated report hash.

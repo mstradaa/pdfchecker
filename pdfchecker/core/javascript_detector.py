@@ -13,17 +13,23 @@ MAX_EXTRACTION_ERRORS = 10
 logger = logging.getLogger(__name__)
 
 
+# Match lengths are bounded (not open-ended +/*) so scanning large object text
+# or page streams stays linear and cannot backtrack pathologically. The bound
+# matches the amount of JavaScript we would keep anyway (MAX_JS_CONTENT_SIZE).
+_M = MAX_JS_CONTENT_SIZE
+
 JS_OBJECT_PATTERNS = [
-    re.compile(r'/JavaScript\s*\(\s*([^)]+)\s*\)', re.IGNORECASE | re.DOTALL),
-    re.compile(r'/JS\s*\(\s*([^)]+)\s*\)', re.IGNORECASE | re.DOTALL),
-    re.compile(r'/JavaScript\s*<<[^>]*>>', re.IGNORECASE | re.DOTALL),
-    re.compile(r'/JS\s*<<[^>]*>>', re.IGNORECASE | re.DOTALL)
+    re.compile(r'/JavaScript\s*\(\s*([^)]{1,%d})\s*\)' % _M, re.IGNORECASE | re.DOTALL),
+    re.compile(r'/JS\s*\(\s*([^)]{1,%d})\s*\)' % _M, re.IGNORECASE | re.DOTALL),
+    re.compile(r'/JavaScript\s*<<[^>]{0,%d}>>' % _M, re.IGNORECASE | re.DOTALL),
+    re.compile(r'/JS\s*<<[^>]{0,%d}>>' % _M, re.IGNORECASE | re.DOTALL)
 ]
 
 JS_CONTENT_PATTERNS = [
-    re.compile(r'javascript:\s*([^;]+)', re.IGNORECASE | re.DOTALL),
-    re.compile(r'eval\s*\(\s*([^)]+)\s*\)', re.IGNORECASE | re.DOTALL),
-    re.compile(r'function\s+\w+\s*\([^)]*\)\s*{[^}]*}', re.IGNORECASE | re.DOTALL),
+    re.compile(r'javascript:\s*([^;]{1,%d})' % _M, re.IGNORECASE | re.DOTALL),
+    re.compile(r'eval\s*\(\s*([^)]{1,%d})\s*\)' % _M, re.IGNORECASE | re.DOTALL),
+    re.compile(r'function\s+\w+\s*\([^)]{0,%d}\)\s*{[^}]{0,%d}}' % (_M, _M),
+               re.IGNORECASE | re.DOTALL),
 ]
 
 OBFUSCATION_PATTERNS = [

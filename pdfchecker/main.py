@@ -1,4 +1,5 @@
 import argparse
+import getpass
 from pathlib import Path
 import os
 
@@ -27,7 +28,7 @@ from .core.qr_detector import (detect_qr_codes, print_qr_findings,
 from .core.link_extractor import LinkExtractor, defang_url
 from .core.risk_scorer import analyze_pdf_for_risk, print_risk_assessment
 from .core.report_generator import main as report_generator_main
-from .core.utils import get_confirmation
+from .core.utils import get_confirmation, apply_memory_guard
 
 MAX_FILE_SIZE_MB = 100
 MAX_INPUT_LENGTH = 1000
@@ -77,19 +78,23 @@ def handle_config_error(operation_name: str, error: Exception):
 
 def secure_set_api_key():
     print("Setting VirusTotal API key securely...")
-    print("Note: Input will be visible for accuracy. Ensure no one is watching your screen -.-")
-    
+
     try:
-        api_key = get_user_input("Enter your VirusTotal API key: ")
-        
+        # getpass keeps the key off the screen and out of the terminal echo
+        api_key = getpass.getpass("Enter your VirusTotal API key (input hidden): ").strip()
+
+        if len(api_key) > MAX_INPUT_LENGTH:
+            print("Error: Input too long.")
+            return
+
         if not api_key:
             print("Error: No API key provided.")
             return
-            
+
         success, message = config_manager.set_api_key_secure(api_key)
         print(f"{'Success' if success else 'Error'}: {message}")
-        
-    except KeyboardInterrupt:
+
+    except (EOFError, KeyboardInterrupt):
         print("\nOperation cancelled.")
     except Exception as e:
         handle_config_error("API key setting", e)
@@ -196,6 +201,9 @@ def handle_pdf_analysis(args):
     for arg_name, (handler, bulk_handler, label) in analysis_map.items():
         target = getattr(args, arg_name)
         if target:
+            # Cap this process's memory before parsing any untrusted PDF so a
+            # decompression bomb aborts rather than exhausting the host
+            apply_memory_guard()
             if Path(target).is_dir():
                 bulk_processor.run_bulk_analysis(
                     target, label, bulk_handler,

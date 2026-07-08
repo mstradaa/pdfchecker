@@ -46,7 +46,10 @@ _EMBEDDED_FILE_PATTERN = re.compile(r'/EmbeddedFile(?![0-9A-Za-z])')
 # normalizes names when parsing, so evasion attempts are only visible in the
 # raw file. Only names decoding to a risky keyword are flagged, which keeps
 # random matches inside compressed streams out of the results.
-_OBFUSCATED_NAME_PATTERN = re.compile(rb'/([0-9A-Za-z#]*#[0-9A-Fa-f]{2}[0-9A-Za-z#]*)')
+# The token length is bounded (PDF names are <=127 bytes per the spec) so the
+# scan over the whole raw file stays linear and cannot backtrack pathologically.
+_OBFUSCATED_NAME_PATTERN = re.compile(
+    rb'/([0-9A-Za-z#]{0,127}#[0-9A-Fa-f]{2}[0-9A-Za-z#]{0,127})')
 _OBFUSCATION_TARGET_KEYWORDS = frozenset([
     'javascript', 'js', 'launch', 'openaction', 'aa', 'embeddedfile',
     'richmedia', 'xfa', 'uri', 'action', 'gotor', 'gotoe', 'names', 'filespec'
