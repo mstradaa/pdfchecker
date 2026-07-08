@@ -1,114 +1,107 @@
 # PDF Security Checker
 
-![pdfc_logo](./docs/logo.png)
+PDF Security Checker is a command-line tool that inspects PDF files for security threats and extracts forensic information. It combines cryptographic hashing, embedded-script analysis, structural inspection, and threat-intelligence enrichment into a single risk score, and can produce tamper-evident PDF reports suitable for professional use.
 
-## Overview
+A sample of the generated report is available [here](https://github.com/Strateo/pdfchecker/blob/main/docs/report_sample.pdf).
 
-**PDF Security Checker** is a cross-platform tool designed to evaluate PDF files for security threats and extract forensic-value information. It detects malicious indicators through hash validation, embedded script analysis, and metadata inspection. Reports are generated with forensic integrity in mind, incorporating cryptographic proof and principles of reproducibility.
+## Available Features
 
-You can find a sample of the generated report [here](https://github.com/Strateo/pdfchecker/blob/main/docs/Report_sample.pdf).
+- **Link extraction** — Finds all URIs in a document, optionally displays them defanged, and checks them against VirusTotal.
+- **Metadata analysis** — Extracts document properties, PDF/A and PDF/X compliance, and file-system attributes (size, timestamps, permissions).
+- **JavaScript detection** — Extracts document-, page-, and form-level JavaScript and flags patterns that suggest malicious intent, distinguishing auto-run scripts from inert ones.
+- **Embedded file detection** — Enumerates attachments and hidden `/EmbeddedFile` streams, classifies them by extension, magic bytes, and content mismatches, hashes each payload, and can safely extract them.
+- **Structural anomaly detection** — Flags dangerous constructs such as `/Launch`, `/OpenAction`, `/AA`, XFA forms, RichMedia, remote GoTo, and name-obfuscated keywords, and reports integrity signals like incremental updates and repaired cross-reference tables.
+- **QR code detection** — Renders pages and decodes QR codes so URLs hidden in images can be reviewed, defanged, and checked like ordinary links (optional dependency).
+- **Risk scoring** — Combines all modules into a single weighted 0–100 score with a per-category breakdown and a Minimal-to-Critical rating; decisive indicators raise a severity floor so they cannot be averaged away.
+- **Hashing** — Computes MD5, SHA-1, and SHA-256 hashes for integrity and authenticity, with optional VirusTotal lookup of the SHA-256 hash.
+- **Report generation** — Produces a comprehensive PDF report covering every module, including both the original file's hash and the report's own hash for integrity verification.
+- **Bulk processing** — Any analysis accepts a folder and processes every PDF in it, running work in parallel and ranking files by risk.
+- **Machine-readable output** — `--json` emits a single structured document to stdout for use in scripts, CI pipelines, or mail-gateway automation.
 
-## Features
+## Installation
 
-### 1. Link Extraction and Analysis
-- **URI Extraction**: Identifies and extracts all URI links embedded within a PDF file.
-- **VirusTotal URL Check**: Optionally checks extracted URLs against VirusTotal to assess potential threats.
-- **Defanged URL Display**: Provides an option to display URLs in a defanged format to prevent accidental clicks.
-
-### 2. Metadata and JavaScript Analysis
-- **Metadata Extraction**: Retrieves and displays metadata information, including document properties, system properties and PDF/A or PDF/X compliance.
-- **File System Attributes**: Provides detailed file system attributes such as size, creation date, last access date and permissions.
-
-- **JavaScript Extraction**: Identifies and extracts JavaScript code from various sections of a PDF, including document-level, page-level, and form fields.
-- **Suspicious Pattern Analysis**: Analyzes extracted JavaScript for patterns that may indicate malicious intent.
-
-### 3. Hash Calculation and Verification
-
-- **MD5, SHA-1, and SHA-256 Hashes**: Calculates cryptographic hashes for PDF files to ensure data integrity and verify authenticity.
-- **VirusTotal Integration**: Optionally checks the SHA-256 hash against VirusTotal's database to identify known malicious files.
-
-### 4. Report Generation
-- **Detailed PDF Reports**: Generates comprehensive reports that include all the modules above, such as hash values, link analysis, metadata, and JavaScript findings.
-- **Dual-Hash System**: Provides both the original PDF's hash and the final report's hash to ensure report integrity and support evidentiary standards.
-
-
-
-## Installation & Usage
-
-### Installation
-
-Ensure you have Python 3.8 or higher installed along with the required dependencies listed in `pyproject.toml`.
+PDF Security Checker requires Python 3.8 or higher.
 
 ```bash
 # Clone the repository
-git clone https://github.com/strateo/pdfchecker.git
+git clone https://github.com/mstradaa/pdfchecker.git
 cd pdfchecker
 
-# Install 
+# Install (provides the `pdfchecker` command)
 pip install -e .
+
+# Optional: enable QR code detection
+pip install -e '.[qr]'
 ```
 
-### Command-Line Interface
+The tool can also be run without installing: `python pdfchecker/main.py <options>`.
 
-The tool provides a command-line interface with the following options:
+## How to Use It
 
-- `-hc, --hash-checker <PDF_FILE_OR_DIR>`: Generate hash values for a PDF file.
-- `-l, --links <PDF_FILE_OR_DIR>`: Extract, defang, and optionally enrich links from a PDF file.
-- `-m, --metadata <PDF_FILE_OR_DIR>`: Extract and display PDF metadata information.
-- `-js, --javascript <PDF_FILE_OR_DIR>`: Analyze and detect JavaScript in the PDF file.
-- `-r, --report <PDF_FILE_OR_DIR>`: Generate a PDF report with hash, links, metadata, JavaScript information and optional VT enrichment.
+Pass one analysis option followed by a PDF file (or a folder for bulk mode):
+
+```bash
+pdfchecker -m suspicious.pdf        # extract metadata
+pdfchecker -rs suspicious.pdf       # compute a risk score
+pdfchecker -r ./samples/            # generate a report for every PDF in a folder
+```
+
+### Analysis Options
+
+| Option | Description |
+| --- | --- |
+| `-hc, --hash-checker` | Compute MD5, SHA-1, and SHA-256 hashes |
+| `-l, --links` | Extract, defang, and optionally check links |
+| `-m, --metadata` | Extract document and file-system metadata |
+| `-js, --javascript` | Detect and analyze JavaScript |
+| `-ef, --embedded-files` | Detect and optionally extract embedded files |
+| `-sa, --structure` | Detect structural anomalies |
+| `-qr, --qr-codes` | Detect and decode QR codes |
+| `-rs, --risk-score` | Compute a 0–100 risk score across all modules |
+| `-r, --report` | Generate a comprehensive PDF report |
+| `--json` | Emit machine-readable JSON instead of interactive text |
+
+Each option accepts either a single PDF or a folder path.
 
 ### Bulk Mode
 
-Every analysis option also accepts a folder path. When a folder is provided, PDFChecker switches to bulk mode: it lists the PDF files found in the folder (non-recursive) and asks for a Y/N confirmation before scanning them.
+When a folder is given, the tool lists the PDFs found (non-recursive) and asks for confirmation before scanning. Interactive questions are asked once and applied to the whole batch. Files are processed in parallel — hashing in a thread pool and PyMuPDF analyses in isolated worker processes, so a malformed PDF cannot bring down the run. VirusTotal checks share one call budget across the batch, files above the 100MB limit are skipped, and risk-scoring mode ranks results highest-first. Embedded-file extraction is offered in single-file mode only.
+
+### JSON Output
+
+Adding `--json` to any analysis option makes the tool print one structured JSON document to stdout, like an API response, so results can be consumed by other programs.
 
 ```bash
-# Analyze a single PDF
-python source/main.py -m suspicious.pdf
+# Risk score of a single PDF as JSON
+pdfchecker -rs suspicious.pdf --json
 
-# Analyze every PDF in a folder (asks for confirmation first)
-python source/main.py -m ./samples/
+# Score every PDF in a folder and extract path/score pairs
+pdfchecker -rs ./samples/ --json 2>/dev/null | jq '[.files[] | {path, score: .result.score, level: .result.level}]'
 ```
 
-Bulk mode behavior:
-- Interactive questions (VirusTotal enrichment, defanged output, operator name) are asked once and applied to all files.
-- Per-file work runs in parallel: hashing uses a thread pool, while PyMuPDF-based analyses (links, metadata, JavaScript, reports) run in isolated worker processes, so a malformed PDF cannot take down the whole batch.
-- VirusTotal checks share a single API call budget across the entire batch, and a URL appearing in multiple PDFs is only checked once.
-- Files larger than the 100MB limit are skipped with a notice; in report mode, previously generated `*_report.pdf` files are excluded automatically.
+JSON mode is fully non-interactive: no prompts, no VirusTotal enrichment, and no file extraction, so it is safe to run unattended. Only the JSON document goes to stdout; progress and warnings go to stderr. Exit codes are `0` on completion (bulk runs return `0` even when individual files fail, check `summary.failed`), `1` on a hard failure, and `2` on a usage error. The schema is versioned via `schema_version`.
 
-### VirusTotal API Key Management
+### VirusTotal API Key
 
-- `--set-api-key`: Set your VirusTotal API key.
-- `--remove-api-key`: Remove your VirusTotal API key.
-- `--show-api-key`: Show your current VirusTotal API key (double confirmation).
-- `--edit-api-limit`: View and edit the API call limit for VirusTotal (default value is set to 10 calls per single operation).
+```bash
+pdfchecker --set-api-key       # store your key securely
+pdfchecker --show-api-key      # display it, masked
+pdfchecker --remove-api-key    # delete the stored key
+pdfchecker --edit-api-limit    # view or change the per-operation call limit (default 10)
+```
 
-
+The key can also be supplied through the `PDFCHECKER_VT_API_KEY` (or `VT_API_KEY`) environment variable, which takes precedence over the stored key and is useful on CI or headless machines.
 
 ## Security Considerations
 
-### Input & Content Validation
-- File type, path, and size validation (100MB limit).
-- JavaScript preview and metadata extraction length limits to prevent overloads.
-- Controlled API input with retry safeguards.
+- **Input validation** — File type, path, and size are validated (100MB limit), and JavaScript/metadata extraction is length-capped to prevent resource exhaustion. A memory guard aborts on decompression bombs.
+- **Secure API handling** — VirusTotal traffic is HTTPS-only with strict timeouts, duplicate URLs are checked once, and API keys are cleaned from memory after use.
+- **Key storage** — Keys are stored in the OS-native keychain (Keychain, Credential Manager, GNOME Keyring, KWallet); insecure plaintext backends are rejected. An environment variable can be used on headless systems instead.
+- **Forensic integrity** — Reports include both the original file's hash and the report's own hash, UTC timestamps, and tool-version tagging to support reproducible, evidentiary-grade analysis.
+- **Data protection** — No sensitive data is cached to disk, in-memory cleanup avoids residual traces, and logs are sanitized of identifying information.
 
-### Secure API Handling
-- API communication is HTTPS-only with strict timeout enforcement.
-- Duplicate Call Prevention: Identical links within the same document are scanned only once to minimize redundant VirusTotal API usage (URLs with different paths or subdomains are treated as distinct and checked separately).
-- API key memory cleaning to avoid memory dumps or swap files. 
-- API keys are encrypted and stored using OS-native keychain utilities (Keychain, Credential manager, Gnome Keyring, KWallet).
+## Roadmap
 
-### Forensic Features
-- Dual-hash integrity: report includes original PDF hash and generated report hash.
-- UTC timestamps, tool version tagging, and reproducible analysis metadata.
-- Designed to meet evidentiary standards for professional and legal use.
-
-### Data Protection
-- No local caching of sensitive data.
-- In-memory cleanup routines to avoid residual traces.
-- Sanitized logs to exclude sensitive or identifying information.
-
-## Future Enhancements & Roadmap
 - [ ] Abuse.ch enrichment support.
-- [ ] Risk scoring based on links, JS, metadata, and structural anomalies.
 - [ ] Export extracted indicators (URLs, domains, JS strings) in STIX / JSON.
+- [ ] YARA rule scanning against raw PDF streams.

@@ -1,10 +1,10 @@
 import fitz
-import requests
 import os
 import time
 from typing import List, Dict, Optional, Tuple, Set
 from .config_manager import get_api_key, get_api_limit
-from .utils import get_confirmation
+from .utils import (get_confirmation, http_request_json,
+                    HTTPStatusError, HTTPTimeoutError, HTTPNetworkError)
 
 REQUEST_TIMEOUT = 30
 ANALYSIS_POLL_INTERVAL = 3
@@ -43,30 +43,44 @@ class LinkExtractor:
             self._api_initialized = True
             return False
     
-    def extract_links_from_pdf(self, pdf_path: str) -> List[str]:
+    @staticmethod
+    def _collect_page_links(doc) -> List[str]:
         links = []
-        doc = None
-        original_stats = None
-        try:
-            # Capture original file timestamps
-            original_stats = os.stat(pdf_path)
-            doc = fitz.open(pdf_path)
-            for page in doc:
-                link_list = page.get_links()
-                for link in link_list:
-                    if link["kind"] == fitz.LINK_URI:
-                        links.append(link["uri"])
-        except Exception as e:
-            print(f"Error extracting links: {str(e)}")
-        finally:
-            if doc:
-                doc.close()
-            if original_stats:
-                try:
-                    os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-                except Exception:
-                    pass
-        
+        for page in doc:
+            link_list = page.get_links()
+            for link in link_list:
+                if link["kind"] == fitz.LINK_URI:
+                    links.append(link["uri"])
+        return links
+
+    def extract_links_from_pdf(self, pdf_path: str, doc=None) -> List[str]:
+        # When the caller passes an already-open document it owns opening,
+        # closing and timestamp restoration
+        links = []
+        if doc is not None:
+            try:
+                links = self._collect_page_links(doc)
+            except Exception as e:
+                print(f"Error extracting links: {str(e)}")
+        else:
+            opened_doc = None
+            original_stats = None
+            try:
+                # Capture original file timestamps
+                original_stats = os.stat(pdf_path)
+                opened_doc = fitz.open(pdf_path)
+                links = self._collect_page_links(opened_doc)
+            except Exception as e:
+                print(f"Error extracting links: {str(e)}")
+            finally:
+                if opened_doc:
+                    opened_doc.close()
+                if original_stats:
+                    try:
+                        os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
+                    except Exception:
+                        pass
+
         seen = set()
         unique_links = []
         for link in links:
@@ -75,6 +89,13 @@ class LinkExtractor:
                 unique_links.append(link)
         return unique_links
     
+    # Reserve one call from the shared budget; False when the limit is exhausted
+    def consume_api_call(self) -> bool:
+        if self.api_calls_made >= self.api_limit:
+            return False
+        self.api_calls_made += 1
+        return True
+
     def check_link_virustotal(self, url: str) -> Optional[Dict]:
         if url in self.checked_urls:
             return None
@@ -87,40 +108,37 @@ class LinkExtractor:
         try:
             headers = {"x-apikey": self.api_key}
             submit_url = "https://www.virustotal.com/api/v3/urls"
-            response = requests.post(
-                submit_url, 
-                headers=headers, 
-                data={"url": url}, 
-                timeout=REQUEST_TIMEOUT, 
-                verify=True
-            )
+            submission = http_request_json(
+                submit_url, headers=headers, data={"url": url},
+                timeout=REQUEST_TIMEOUT)
             # The submission consumed quota regardless of what happens next, so
             # count it and mark the URL as checked before any later step can fail
             self.api_calls_made += 1
             self.checked_urls.add(url)
-            response.raise_for_status()
 
-            analysis_id = response.json()["data"]["id"]
+            analysis_id = submission["data"]["id"]
             result_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
-            # URL analyses are asynchronous: poll until the scan completes or we give up
+            # URL analyses are asynchronous: poll until the scan completes, the
+            # API call budget runs out, or we give up
             result = None
             for attempt in range(ANALYSIS_MAX_POLLS):
-                response = requests.get(result_url, headers=headers, timeout=REQUEST_TIMEOUT, verify=True)
-                self.api_calls_made += 1
-                response.raise_for_status()
-                result = response.json()
+                if not self.consume_api_call():
+                    print("   API call limit reached while waiting for analysis results.")
+                    break
+                result = http_request_json(result_url, headers=headers,
+                                           timeout=REQUEST_TIMEOUT)
                 status = result.get("data", {}).get("attributes", {}).get("status")
                 if status == "completed":
                     break
                 if attempt < ANALYSIS_MAX_POLLS - 1:
                     time.sleep(ANALYSIS_POLL_INTERVAL)
             return result
-            
-        except requests.exceptions.Timeout:
+
+        except HTTPTimeoutError:
             print("VirusTotal request timed out. Please try again later.")
-        except requests.exceptions.HTTPError as e:
-            print(f"VirusTotal API error: HTTP {e.response.status_code}")
-        except requests.exceptions.RequestException:
+        except HTTPStatusError as e:
+            print(f"VirusTotal API error: HTTP {e.status}")
+        except HTTPNetworkError:
             print("Network error communicating with VirusTotal")
         except Exception:
             print("Unexpected error checking URL with VirusTotal")
@@ -147,11 +165,11 @@ def main(pdf_path: str, defanged: bool = False, validate_pdf_file=None):
     if validate_pdf_file and not validate_pdf_file(pdf_path):
         return
     extractor = LinkExtractor()
-    
+
     try:
         print(f"Extracting links from {pdf_path}...")
         links = extractor.extract_links_from_pdf(pdf_path)
-    
+
         if not links:
             print("No links found in the PDF.")
             return
@@ -227,10 +245,10 @@ def main(pdf_path: str, defanged: bool = False, validate_pdf_file=None):
     finally:
         extractor.reset()
 
-def extract_links(pdf_path: str) -> List[str]:
+def extract_links(pdf_path: str, doc=None) -> List[str]:
     extractor = LinkExtractor()
     try:
-        return extractor.extract_links_from_pdf(pdf_path)
+        return extractor.extract_links_from_pdf(pdf_path, doc=doc)
     finally:
         extractor.reset()
 
