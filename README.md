@@ -69,6 +69,7 @@ A low score is a local heuristic result, not proof that a file is safe.
 
 The [usage reference](docs/usage.md) covers every command-line option and how to:
 
+- [Apply policies](docs/usage.md#policies) to reject risky files
 - [Scan folders and group related samples](docs/usage.md#bulk-scans-and-related-samples)
 - [Scan password-protected PDFs](docs/usage.md#password-protected-pdfs)
 - [Understand URL discovery](docs/usage.md#url-discovery) and link mismatches
@@ -77,32 +78,6 @@ The [usage reference](docs/usage.md) covers every command-line option and how to
 - [Export indicators](docs/usage.md#indicator-export) as JSON or STIX 2.1
 - [Configure VirusTotal and URLhaus keys](docs/usage.md#threat-intelligence-keys)
 - [Review the processing limits](docs/usage.md#limits)
-
-## Policies
-
-Use `--fail-on-risk N` for a simple inclusive threshold, or `--policy FILE` for a
-reusable JSON policy:
-
-```json
-{
-  "risk_threshold": 55,
-  "reject_javascript": true,
-  "reject_attachments": true,
-  "reject_link_mismatch": true,
-  "reject_yara": true,
-  "require_complete": true
-}
-```
-
-All keys are optional; omitted boolean rules are disabled. `--fail-on-risk`
-overrides the policy's threshold. `reject_yara` requires
-[`--yara RULES`](docs/usage.md#local-yara-rules), and `require_complete` blocks
-files whose coverage is incomplete. An unevaluable
-required check is reported as unknown, never as a policy pass.
-
-```bash
-pdfchecker -a samples/ --policy policy.json --yara rules.yar
-```
 
 ## Performance
 

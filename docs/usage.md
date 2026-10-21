@@ -1,9 +1,10 @@
 # Usage Reference
 
-Complete command-line reference for PDF Security Checker. For installation, the
-quick start, and policies, see the [README](../README.md).
+Complete command-line reference for PDF Security Checker. For installation and the
+quick start, see the [README](../README.md).
 
 - [Options](#options)
+- [Policies](#policies)
 - [Bulk Scans and Related Samples](#bulk-scans-and-related-samples)
 - [Password-Protected PDFs](#password-protected-pdfs)
 - [URL Discovery](#url-discovery)
@@ -43,7 +44,7 @@ pdfchecker -r ./samples/            # generate a report for every PDF in a folde
 
 | Option | Description |
 | --- | --- |
-| `--policy FILE` | Apply a JSON policy file (see [Policies](../README.md#policies)) |
+| `--policy FILE` | Apply a JSON policy file (see [Policies](#policies)) |
 | `--fail-on-risk N` | Reject a file at or above this score (0–100) |
 | `--yara RULES` | Match local YARA rules; repeat for more files (requires the `yara` extra) |
 | `--campaigns` | Group a folder by shared URLs, scripts, and attachment hashes |
@@ -81,6 +82,32 @@ pdfchecker -r ./samples/            # generate a report for every PDF in a folde
 | `--show-urlhaus-api-key` | Display the stored URLhaus Auth-Key, masked |
 | `--remove-urlhaus-api-key` | Delete the stored URLhaus Auth-Key |
 | `--edit-api-limit` | View or change the per-provider call limit (default 10) |
+
+## Policies
+
+Use `--fail-on-risk N` for a simple inclusive threshold, or `--policy FILE` for a
+reusable JSON policy:
+
+```json
+{
+  "risk_threshold": 55,
+  "reject_javascript": true,
+  "reject_attachments": true,
+  "reject_link_mismatch": true,
+  "reject_yara": true,
+  "require_complete": true
+}
+```
+
+All keys are optional; omitted boolean rules are disabled. `--fail-on-risk`
+overrides the policy's threshold. `reject_yara` requires
+[`--yara RULES`](#local-yara-rules), and `require_complete` blocks files whose
+coverage is incomplete. An unevaluable required check is reported as unknown,
+never as a policy pass.
+
+```bash
+pdfchecker -a samples/ --policy policy.json --yara rules.yar
+```
 
 ## Bulk Scans and Related Samples
 
@@ -124,7 +151,7 @@ recovered JavaScript, keeping the source page, object, or script of each URL.
 
 A visible URL that names a different site than its annotation destination is
 flagged as a mismatch, adds 10 points to the links risk category, and can be
-rejected with the `reject_link_mismatch` [policy](../README.md#policies) rule.
+rejected with the `reject_link_mismatch` [policy](#policies) rule.
 `www.` prefixes and links between a site and its own subdomains are not
 mismatches; redirects and benign tracking links can still cause them.
 
