@@ -10,7 +10,10 @@ from pathlib import Path
 
 import fitz
 
-from .utils import build_xref_object_cache
+from .coverage import check_coverage, print_coverage
+from .pdf_access import document
+from .pdf_objects import Name, listed_attachment_streams, object_map
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +45,6 @@ _MAGIC_SIGNATURES = [
     (b'\xd0\xcf\x11\xe0', "Legacy Office / OLE container", False),
 ]
 
-_INDIRECT_REF_PATTERN = re.compile(r'(\d+)\s+0\s+R')
-_EF_DICT_PATTERN = re.compile(r'/EF\s*<<(.*?)>>', re.DOTALL)
-_EF_INDIRECT_PATTERN = re.compile(r'/EF\s+(\d+)\s+0\s+R')
-_EMBEDDED_FILE_KEY_PATTERN = re.compile(r'/EmbeddedFile(?![0-9A-Za-z])')
-
-
 def _hash_bytes(data):
     return {
         'MD5': hashlib.md5(data).hexdigest(),
@@ -55,7 +52,7 @@ def _hash_bytes(data):
     }
 
 
-def _detect_content_type(data):
+def detect_content_type(data):
     if not data:
         return None, False
     for magic, description, high_risk in _MAGIC_SIGNATURES:
@@ -83,7 +80,7 @@ def _assess_risk(filename, data):
         if risk == "Low":
             risk = "Medium"
 
-    content_type, content_high_risk = _detect_content_type(data)
+    content_type, content_high_risk = detect_content_type(data)
     if content_high_risk:
         risk = "High"
         reasons.append(f"Executable content detected: {content_type}")
@@ -130,6 +127,24 @@ class EmbeddedFindings:
         }
 
 
+def _attachment_entry(source, index, filename, info, data, include_data):
+    risk, reasons, content_type = _assess_risk(filename, data)
+    entry = {
+        "source": source,
+        "index": index,
+        "filename": filename,
+        "description": info.get('desc') or "",
+        "size": len(data) if data else info.get('size', 0),
+        "hashes": _hash_bytes(data) if data else {},
+        "content_type": content_type,
+        "risk": risk,
+        "risk_reasons": reasons
+    }
+    if include_data:
+        entry["data"] = data
+    return entry
+
+
 def _collect_name_tree_attachments(doc, findings, include_data):
     for index in range(doc.embfile_count()):
         try:
@@ -141,21 +156,8 @@ def _collect_name_tree_attachments(doc, findings, include_data):
             continue
 
         filename = info.get('filename') or info.get('ufilename') or info.get('name') or f"attachment_{index}"
-        risk, reasons, content_type = _assess_risk(filename, data)
-        entry = {
-            "source": "EmbeddedFiles name tree",
-            "index": index,
-            "filename": filename,
-            "description": info.get('desc') or "",
-            "size": len(data) if data else info.get('size', 0),
-            "hashes": _hash_bytes(data) if data else {},
-            "content_type": content_type,
-            "risk": risk,
-            "risk_reasons": reasons
-        }
-        if include_data:
-            entry["data"] = data
-        findings.embedded_files.append(entry)
+        findings.embedded_files.append(_attachment_entry(
+            "EmbeddedFiles name tree", index, filename, info, data, include_data))
 
 
 def _collect_annotation_attachments(doc, findings, include_data):
@@ -174,66 +176,30 @@ def _collect_annotation_attachments(doc, findings, include_data):
                 continue
 
             filename = info.get('filename') or f"page{page_num + 1}_attachment"
-            risk, reasons, content_type = _assess_risk(filename, data)
-            entry = {
-                "source": f"FileAttachment annotation (page {page_num + 1})",
-                "index": None,
-                "filename": filename,
-                "description": info.get('desc') or "",
-                "size": len(data) if data else info.get('size', 0),
-                "hashes": _hash_bytes(data) if data else {},
-                "content_type": content_type,
-                "risk": risk,
-                "risk_reasons": reasons
-            }
-            if include_data:
-                entry["data"] = data
-            findings.embedded_files.append(entry)
+            findings.embedded_files.append(_attachment_entry(
+                f"FileAttachment annotation (page {page_num + 1})", None,
+                filename, info, data, include_data))
 
 
 def _find_hidden_streams(doc, findings, include_data, xref_cache=None):
-    # Streams referenced from any /EF dictionary are legitimate attachments;
-    # /EmbeddedFile streams outside that set are hidden or orphaned payloads.
-    referenced = set()
-    ef_dict_xrefs = set()
-    embedded_stream_xrefs = []
-
-    entries = xref_cache if xref_cache is not None else build_xref_object_cache(doc)
-    for xref_num, (obj, _error) in entries.items():
-        if not obj:
+    objects = object_map(doc, xref_cache)
+    recovered = listed_attachment_streams(doc, objects)
+    for xref_num, obj in objects.items():
+        if not isinstance(obj, dict) or obj.get('Type') != Name('EmbeddedFile'):
             continue
-        for ef_match in _EF_DICT_PATTERN.finditer(obj):
-            for ref in _INDIRECT_REF_PATTERN.findall(ef_match.group(1)):
-                referenced.add(int(ref))
-        # /EF may also be an indirect reference to the dictionary itself
-        for ref in _EF_INDIRECT_PATTERN.findall(obj):
-            ef_dict_xrefs.add(int(ref))
-        if _EMBEDDED_FILE_KEY_PATTERN.search(obj) and doc.xref_is_stream(xref_num):
-            embedded_stream_xrefs.append(xref_num)
-
-    for ef_xref in ef_dict_xrefs:
-        ef_obj, _error = entries.get(ef_xref, (None, None))
-        if ef_obj:
-            for ref in _INDIRECT_REF_PATTERN.findall(ef_obj):
-                referenced.add(int(ref))
-
-    for xref_num in embedded_stream_xrefs:
-        if xref_num in referenced:
+        if xref_num in recovered or not doc.xref_is_stream(xref_num):
             continue
         try:
             data = doc.xref_stream(xref_num)
-        except Exception:
-            data = None
-        content_type, high_risk = _detect_content_type(data)
-        entry = {
-            "xref": xref_num,
-            "size": len(data) if data else 0,
-            "hashes": _hash_bytes(data) if data else {},
-            "content_type": content_type,
-            "risk": "High" if high_risk else "Medium"
-        }
+        except Exception as exc:
+            findings.add_error(f"Embedded stream {xref_num} read error: {exc}")
+            continue
+        hashes = _hash_bytes(data)
+        content_type, high_risk = detect_content_type(data)
+        entry = {"xref": xref_num, "size": len(data), "hashes": hashes,
+                 "content_type": content_type, "risk": "High" if high_risk else "Medium"}
         if include_data:
-            entry["data"] = data
+            entry['data'] = data
         findings.hidden_streams.append(entry)
 
 
@@ -243,36 +209,14 @@ def _collect_from_document(doc, findings, include_data, xref_cache=None):
     _find_hidden_streams(doc, findings, include_data, xref_cache)
 
 
-def detect_embedded_files(pdf_path, validate_pdf_file=None, include_data=False,
-                          doc=None, xref_cache=None):
-    if validate_pdf_file and not validate_pdf_file(pdf_path):
-        return None
-
-    # When the caller passes an already-open document it owns opening,
-    # closing and timestamp restoration
-    original_stats = None
-    if doc is None:
-        try:
-            original_stats = os.stat(pdf_path)
-        except Exception:
-            pass
-
+def detect_embedded_files(pdf_path, include_data=False, doc=None, xref_cache=None):
     findings = EmbeddedFindings()
     try:
-        if doc is not None:
-            _collect_from_document(doc, findings, include_data, xref_cache)
-        else:
-            with fitz.open(pdf_path) as opened_doc:
-                _collect_from_document(opened_doc, findings, include_data, xref_cache)
+        with document(pdf_path, doc) as opened:
+            _collect_from_document(opened, findings, include_data, xref_cache)
     except Exception as e:
         logger.error(f"Error detecting embedded files: {str(e)}")
         findings.add_error(f"General embedded file detection error: {str(e)}")
-    finally:
-        if original_stats:
-            try:
-                os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-            except Exception:
-                pass
 
     return findings.to_dict()
 
@@ -338,6 +282,7 @@ def extract_embedded_files(pdf_path, output_dir=None, findings=None):
 
 
 def print_embedded_findings(findings):
+    print_coverage({'attachments': check_coverage('attachments', findings)})
     if not findings:
         print("No embedded file analysis results available.")
         return
@@ -366,7 +311,7 @@ def print_embedded_findings(findings):
             print(f"   Content Type: {stream['content_type']}")
         for hash_type, value in stream['hashes'].items():
             print(f"   {hash_type}: {value}")
-        print(f"   Risk: {stream['risk']} (not referenced by any file specification)")
+        print(f"   Risk: {stream['risk']} (not listed as a document attachment)")
 
     if findings['errors']:
         print("\n--- Extraction Errors ---")

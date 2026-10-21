@@ -6,10 +6,12 @@
 # degrades gracefully when it is not installed.
 import importlib.util
 import logging
-import os
 import re
 
 import fitz
+
+from .coverage import check_coverage, print_coverage
+from .pdf_access import document
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,9 @@ cv2 = None
 np = None
 
 
-def _ensure_qr_support():
+# Callers check support through this function rather than importing the flag:
+# it turns False here when the optional install turns out to be broken.
+def qr_supported():
     global cv2, np, QR_SUPPORT
     if cv2 is not None:
         return True
@@ -47,6 +51,10 @@ RENDER_DPI = 150
 MAX_QR_PAGES = 200
 MAX_PAYLOAD_LENGTH = 2000
 MAX_QR_ERRORS = 10
+# A page's media box can be enormous (up to ~200 inches per side) independent of
+# file size, so cap the rendered bitmap; the DPI is scaled down to stay within
+# this budget to keep a single crafted page from exhausting memory (~64 MB gray).
+MAX_RENDER_PIXELS = 64_000_000
 
 _URL_PATTERN = re.compile(r'^(?:[a-zA-Z][a-zA-Z0-9+.-]*://|www\.)', re.IGNORECASE)
 
@@ -55,16 +63,30 @@ def is_url_payload(payload):
     return bool(payload) and bool(_URL_PATTERN.match(payload.strip()))
 
 
+def url_payloads(results):
+    return [qr["payload"] for qr in (results or {}).get("qr_codes", [])
+            if qr["type"] == "URL"]
+
+
+def _safe_render_dpi(page):
+    # Scale the DPI down for oversized pages so width*height stays within the
+    # pixel budget; normal-sized pages keep the full RENDER_DPI.
+    rect = page.rect
+    est_pixels = (rect.width / 72 * RENDER_DPI) * (rect.height / 72 * RENDER_DPI)
+    if est_pixels <= MAX_RENDER_PIXELS or est_pixels <= 0:
+        return RENDER_DPI
+    return max(1, int(RENDER_DPI * (MAX_RENDER_PIXELS / est_pixels) ** 0.5))
+
+
 def _decode_page(page, detector):
-    pix = page.get_pixmap(dpi=RENDER_DPI, colorspace=fitz.csGRAY, alpha=False)
+    pix = page.get_pixmap(dpi=_safe_render_dpi(page), colorspace=fitz.csGRAY, alpha=False)
     # pix.samples rows are padded to pix.stride bytes; crop to real width
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
 
     try:
         found, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
     except cv2.error as e:
-        logger.debug(f"OpenCV QR decode error: {str(e)}")
-        return []
+        raise ValueError(f"QR decoder failed: {e}") from e
 
     if not found or decoded_info is None:
         return []
@@ -73,7 +95,6 @@ def _decode_page(page, detector):
 
 def _scan_document_qr(doc, results):
     detector = cv2.QRCodeDetector()
-    seen_payloads = set()
 
     for page_num, page in enumerate(doc):
         if page_num >= MAX_QR_PAGES:
@@ -94,9 +115,6 @@ def _scan_document_qr(doc, results):
                 results["undecoded_count"] += 1
                 continue
             payload = payload[:MAX_PAYLOAD_LENGTH]
-            if payload in seen_payloads:
-                continue
-            seen_payloads.add(payload)
             results["qr_codes"].append({
                 "page": page_num + 1,
                 "type": "URL" if is_url_payload(payload) else "Text",
@@ -106,11 +124,8 @@ def _scan_document_qr(doc, results):
     results["qr_count"] = len(results["qr_codes"])
 
 
-def detect_qr_codes(pdf_path, validate_pdf_file=None, doc=None):
-    if validate_pdf_file and not validate_pdf_file(pdf_path):
-        return None
-
-    supported = _ensure_qr_support()
+def detect_qr_codes(pdf_path, doc=None):
+    supported = qr_supported()
     results = {
         "supported": supported,
         "qr_count": 0,
@@ -124,35 +139,18 @@ def detect_qr_codes(pdf_path, validate_pdf_file=None, doc=None):
         results["errors"].append(QR_UNAVAILABLE_MESSAGE)
         return results
 
-    # When the caller passes an already-open document it owns opening,
-    # closing and timestamp restoration
-    original_stats = None
-    if doc is None:
-        try:
-            original_stats = os.stat(pdf_path)
-        except Exception:
-            pass
-
     try:
-        if doc is not None:
-            _scan_document_qr(doc, results)
-        else:
-            with fitz.open(pdf_path) as opened_doc:
-                _scan_document_qr(opened_doc, results)
+        with document(pdf_path, doc) as opened:
+            _scan_document_qr(opened, results)
     except Exception as e:
         logger.error(f"Error detecting QR codes: {str(e)}")
         results["errors"].append(f"General QR detection error: {str(e)}")
-    finally:
-        if original_stats:
-            try:
-                os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-            except Exception:
-                pass
 
     return results
 
 
 def print_qr_findings(results, defanged=False, defang_url=None):
+    print_coverage({'qr': check_coverage('qr', results)})
     if not results:
         print("No QR analysis results available.")
         return

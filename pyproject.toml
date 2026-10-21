@@ -1,16 +1,21 @@
 [project]
 name = "pdfchecker"
-version = "1.0.0"
+# The version lives in pdfchecker/__init__.py, which reports and JSON output read
+dynamic = ["version"]
 description = "A tool for analyzing and checking the security of PDF files"
 requires-python = ">=3.8"
+# PyMuPDF parses untrusted PDFs (native MuPDF), so the floor is kept current
+# for upstream memory-safety fixes; it also renders the HTML report via
+# fitz.Story, so no separate HTML-to-PDF engine is needed. Threat-intelligence
+# HTTP (VirusTotal and URLhaus) uses the standard library, so requests is not a
+# dependency.
 dependencies = [
-    "PyMuPDF>=1.23.8",
-    "requests>=2.31.0",
+    "PyMuPDF>=1.24.0",
     "keyring>=24.3.0",
-    "xhtml2pdf>=0.2.11",
 ]
 
 [project.optional-dependencies]
+yara = ["yara-python>=4.3"]
 # QR code detection ("quishing" analysis); everything else works without it
 qr = [
     "opencv-python-headless>=4.8",
@@ -24,8 +29,8 @@ pdfchecker = "pdfchecker.main:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.hatch.version]
+path = "pdfchecker/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["pdfchecker"] 
+packages = ["pdfchecker"]

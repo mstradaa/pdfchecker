@@ -4,8 +4,9 @@ from datetime import datetime, timezone, timedelta
 import logging
 import re
 
-MAX_METADATA_SIZE = 10000
-MAX_STRING_LENGTH = 1000
+from .coverage import check_coverage, print_coverage
+from .pdf_access import document
+from .pdf_objects import javascript_entries, object_map
 
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ def safe_get_attr(obj, attr_name, default="Not available", *args, **kwargs):
         if callable(value):
             return value(*args, **kwargs)
         return value
-    except (AttributeError, Exception) as e:
+    except Exception as e:
         logger.debug(f"Failed to get attribute {attr_name}: {str(e)}")
         return default
 
@@ -240,77 +241,49 @@ def _analyze_pages_combined(doc):
         "has_form_fields": False,
         "has_images": False,
         "has_text": False,
-        "has_javascript": False,
         "first_page_info": {}
     }
-    
+
     try:
-        page_count = len(doc)
-        if page_count == 0:
+        if len(doc) == 0:
             return page_analysis
-        
+
         first_page = doc[0]
         page_analysis["first_page_info"] = {
-            "page_size": safe_get_attr(first_page, "rect"),
+            # A plain string: page info is printed, serialized and sent
+            # between processes, where PyMuPDF objects do not travel reliably
+            "page_size": str(safe_get_attr(first_page, "rect")),
             "page_rotation": safe_get_attr(first_page, "rotation")
         }
 
-        if not page_analysis["has_images"]:
-            page_analysis["has_images"] = bool(safe_get_attr(first_page, "get_images", []))
-        
-        if not page_analysis["has_text"]:
-            page_analysis["has_text"] = bool(safe_get_attr(first_page, "get_text", "").strip())
-        
         for page in doc:
-            if (page_analysis["has_form_fields"] and 
-                page_analysis["has_images"] and 
-                page_analysis["has_text"] and 
-                page_analysis["has_javascript"]):
-                break
-                
-            for annot in (page.annots() or []):
-                annot_type = annot.type
-                if not page_analysis["has_form_fields"] and annot_type[1] == "Widget":
-                    page_analysis["has_form_fields"] = True
-
-                # JavaScript lives in annotation actions, not in an annotation type,
-                # so inspect the raw annotation object for /JavaScript or /JS keys
-                if not page_analysis["has_javascript"] and annot.xref:
-                    try:
-                        annot_obj = doc.xref_object(annot.xref)
-                        if '/JavaScript' in annot_obj or '/JS' in annot_obj:
-                            page_analysis["has_javascript"] = True
-                    except Exception as e:
-                        logger.debug(f"Error reading annotation object: {str(e)}")
-            
             if not page_analysis["has_images"]:
                 page_analysis["has_images"] = bool(safe_get_attr(page, "get_images", []))
-            
             if not page_analysis["has_text"]:
                 page_analysis["has_text"] = bool(safe_get_attr(page, "get_text", "").strip())
-        
-        if not page_analysis["has_form_fields"]:
-            page_analysis["has_form_fields"] = safe_get_attr(doc, "is_form_pdf", False)
-            
+            if page_analysis["has_images"] and page_analysis["has_text"]:
+                break
+
+        # Form fields are widgets, which page.annots() never yields, so the
+        # AcroForm is the source of truth
+        page_analysis["has_form_fields"] = safe_get_attr(doc, "is_form_pdf", False)
+
     except Exception as e:
         logger.debug(f"Error in combined page analysis: {str(e)}")
     return page_analysis
 
 def _get_document_id(doc):
     try:
-        if hasattr(doc, 'xref_get_key') and hasattr(doc, 'xref_get_keys'):
-            try:
-                trailer_keys = doc.xref_get_keys(-1)
-                if 'ID' in trailer_keys:
-                    id_type, id_value = doc.xref_get_key(-1, 'ID')
-                    if id_value:
-                        hex_parts = re.findall(r'<([0-9a-fA-F]+)>', id_value)
-                        if hex_parts:
-                            return hex_parts[0].upper()
-                        return id_value  
-            except Exception as e:
-                logger.debug(f"Error getting trailer ID: {str(e)}")
-        
+        try:
+            if 'ID' in doc.xref_get_keys(-1):
+                _, id_value = doc.xref_get_key(-1, 'ID')
+                if id_value:
+                    hex_parts = re.findall(r'<([0-9a-fA-F]+)>', id_value)
+                    if hex_parts:
+                        return hex_parts[0].upper()
+                    return id_value
+        except Exception as e:
+            logger.debug(f"Error getting trailer ID: {str(e)}")
 
         metadata = doc.metadata
 
@@ -329,23 +302,19 @@ def _get_document_id(doc):
         logger.debug(f"Error getting document ID: {str(e)}")
         return "Not available"
 
-def analyze_pdf_metadata(pdf_path, validate_pdf_file=None, file_stats=None, doc=None):
-    local_file_stats = file_stats  # Use provided stats if available
-    if local_file_stats is None:
+def analyze_pdf_metadata(pdf_path, file_stats=None, doc=None, xref_cache=None):
+    # File-system attributes describe the file before this analysis opened it
+    if file_stats is None:
         try:
-            local_file_stats = os.stat(pdf_path) # Fetch fresh stats *now*
+            file_stats = os.stat(pdf_path)
         except FileNotFoundError:
             logger.error(f"File not found: {pdf_path}")
             return None
         except Exception as e:
             logger.warning(f"Could not get initial file system attributes for {pdf_path}: {str(e)}. Proceeding with caution.")
-            pass # local_file_stats remains None if error other than FileNotFoundError
-
-    if validate_pdf_file and not validate_pdf_file(pdf_path):
-        return None
 
     result = {
-        "file_system": get_file_system_attributes(pdf_path, local_file_stats),
+        "file_system": get_file_system_attributes(pdf_path, file_stats),
         "document_info": {},
         "structural_info": {},
         "page_info": {},
@@ -357,17 +326,15 @@ def analyze_pdf_metadata(pdf_path, validate_pdf_file=None, file_stats=None, doc=
 
     try:
         # A caller running several analyses may pass its already-open document
-        if doc is not None:
-            return _populate_document_metadata(doc, result)
-        with fitz.open(pdf_path) as opened_doc:
-            return _populate_document_metadata(opened_doc, result)
+        with document(pdf_path, doc) as opened:
+            return _populate_document_metadata(opened, result, xref_cache)
 
     except Exception as e:
         logger.error(f"Error analyzing PDF: {str(e)}")
         return None
 
 
-def _populate_document_metadata(doc, result):
+def _populate_document_metadata(doc, result, xref_cache=None):
     metadata = doc.metadata
     processed_metadata = dict(metadata)
     for date_field in ['creationDate', 'modDate']:
@@ -386,7 +353,7 @@ def _populate_document_metadata(doc, result):
     
     format_info = detect_pdf_format(doc, xmp_metadata)
     
-    is_encrypted = safe_get_attr(doc, "is_encrypted")
+    is_encrypted = getattr(doc, "_pdfchecker_encrypted", doc.is_encrypted)
     permissions = safe_get_attr(doc, "permissions")
     
     structural_info = {
@@ -409,23 +376,21 @@ def _populate_document_metadata(doc, result):
     result["structural_info"] = structural_info
     
     page_analysis = _analyze_pages_combined(doc)
-    
+
     result["page_info"] = page_analysis["first_page_info"]
-    
-    has_outline = bool(safe_get_attr(doc, "get_toc", []))
+
     result["document_structure"] = {
-        "has_outline": has_outline,
-        "has_bookmarks": has_outline,
+        "has_outline": bool(safe_get_attr(doc, "get_toc", [])),
         "has_form_fields": page_analysis["has_form_fields"]
     }
-    
-    content_info = {
+
+    result["content_info"] = {
         "has_images": page_analysis["has_images"],
         "has_text": page_analysis["has_text"],
-        "has_javascript": page_analysis["has_javascript"]
+        # Same object-level search as the JavaScript detector, so both agree
+        "has_javascript": any(
+            True for _ in javascript_entries(doc, object_map(doc, xref_cache)))
     }
-    
-    result["content_info"] = content_info
     
     # safe_get_attr returns a truthy "Not available" string on failure
     if is_encrypted is True:
@@ -441,16 +406,17 @@ def _populate_document_metadata(doc, result):
         "page_layout": safe_get_attr(doc, "pagelayout", "Not available"),
         "is_linearized": safe_get_attr(doc, "is_fast_webaccess", False),
         "is_repaired": safe_get_attr(doc, "is_repaired", False),
-        "needs_password": safe_get_attr(doc, "needs_pass", False),
+        "needs_password": getattr(doc, "_pdfchecker_requires_password", doc.is_encrypted),
         "version_count": safe_get_attr(doc, "version_count", 0)
     }
     return result
 
 def print_metadata(metadata):
+    print_coverage({'metadata': check_coverage('metadata', metadata)})
     if not metadata:
-        logger.error("No metadata to print")
+        print("No metadata analysis results available.")
         return
-        
+
     for section, data in metadata.items():
         if data:
             print(f"\n=== {section.replace('_', ' ').title()} ===")

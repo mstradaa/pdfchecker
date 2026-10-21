@@ -1,17 +1,12 @@
 # Risk scoring: combines the findings of the individual analysis modules
 # (JavaScript, structure, embedded files, links, QR codes) into a single
 # weighted 0-100 score with a per-category breakdown, for fast triage.
-import os
 import re
+from ipaddress import ip_address
 
-import fitz
-
-from .embedded_file_detector import detect_embedded_files
-from .javascript_detector import extract_javascript_from_pdf
-from .link_extractor import extract_links
-from .qr_detector import detect_qr_codes
-from .structure_analyzer import analyze_structure
-from .utils import build_xref_object_cache
+from .coverage import finding_errors, print_coverage
+from .terminal import safe_text
+from .url_discovery import hostname, site_host
 
 CATEGORY_WEIGHTS = {
     "javascript": 30,
@@ -37,7 +32,6 @@ _STRUCTURE_SEVERITY_POINTS = {
     "Info": 0,
 }
 
-_IP_URL_PATTERN = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]*://\d{1,3}(?:\.\d{1,3}){3}')
 _RISKY_SCHEME_PATTERN = re.compile(r'^(?:javascript|file|data|vbscript):', re.IGNORECASE)
 _RISKY_FILE_EXT_PATTERN = re.compile(
     r'\.(?:exe|scr|js|vbs|bat|cmd|ps1|jar|apk|msi|hta|zip|rar|7z|iso)(?:$|[?#])',
@@ -47,15 +41,16 @@ _SHORTENER_DOMAINS = frozenset([
     'bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'is.gd', 'buff.ly', 'ow.ly',
     'rebrand.ly', 'cutt.ly', 'rb.gy', 'shorturl.at', 't.ly', 's.id'
 ])
+# Link text naming another site is a phishing hallmark, but redirect and
+# tracking services cause it too, so it adds weight without a severity floor
+_LINK_MISMATCH_POINTS = 10
 
 
 def _url_host(url):
-    try:
-        without_scheme = url.split('://', 1)[1] if '://' in url else url
-        host = without_scheme.split('/', 1)[0].split('?', 1)[0].lower()
-        return host[4:] if host.startswith('www.') else host
-    except Exception:
-        return ""
+    # Scheme-less links ("bit.ly/x") still name a host worth scoring
+    candidate = url.strip()
+    host = hostname(candidate if '://' in candidate else '//' + candidate)
+    return host[4:] if host.startswith('www.') else host
 
 
 def _score_url(url, reasons, context=""):
@@ -64,10 +59,14 @@ def _score_url(url, reasons, context=""):
     if _RISKY_SCHEME_PATTERN.match(url):
         points += 5
         reasons.append(f"{prefix}risky URL scheme ({url.split(':', 1)[0]}:)")
-    if _IP_URL_PATTERN.match(url):
+    host = _url_host(url)
+    try:
+        ip_address(host)
+    except ValueError:
+        pass
+    else:
         points += 5
         reasons.append(f"{prefix}URL points to a raw IP address")
-    host = _url_host(url)
     if host in _SHORTENER_DOMAINS:
         points += 3
         reasons.append(f"{prefix}URL uses a link shortener ({host})")
@@ -146,19 +145,26 @@ def _score_embedded(embedded_findings):
     hidden = embedded_findings.get("hidden_streams", [])
     if hidden:
         points += 8
-        reasons.append(f"{len(hidden)} hidden embedded stream(s) not referenced "
-                       "by any file specification")
+        reasons.append(f"{len(hidden)} hidden embedded stream(s) not listed "
+                       "as document attachments")
     return points, reasons
 
 
-def _score_links(links):
+def _score_links(link_findings):
     reasons = []
-    if not links:
+    if not link_findings:
         return 0, reasons
 
     points = 0
-    for link in links:
-        points += _score_url(link, reasons)
+    for entry in link_findings.get("urls", []):
+        points += _score_url(entry["url"], reasons)
+        shown = sorted({site_host(label) for source in entry["sources"]
+                        if source.get("mismatch")
+                        for label in source.get("displayed_urls", [])} - {''})
+        if shown:
+            points += _LINK_MISMATCH_POINTS
+            reasons.append(f"Link text shows {', '.join(shown)} but opens "
+                           f"{_url_host(entry['url'])}")
     return points, reasons
 
 
@@ -181,6 +187,17 @@ def _score_qr(qr_findings):
     return points, reasons
 
 
+def risk_reasons(assessment):
+    """Every reason, in category order (most heavily weighted first)."""
+    return [reason for category in assessment["categories"].values()
+            for reason in category["reasons"]]
+
+
+def ranking_key(assessment):
+    """Sort key putting the riskiest results first and unscored ones last."""
+    return -assessment["score"] if assessment else 1
+
+
 def risk_level(score):
     for threshold, level in RISK_LEVELS:
         if score >= threshold:
@@ -189,12 +206,19 @@ def risk_level(score):
 
 
 def compute_risk_score(js_findings=None, structure_findings=None,
-                       embedded_findings=None, links=None, qr_findings=None):
+                       embedded_findings=None, link_findings=None, qr_findings=None):
+    errors = [f"{name}: {error}" for name, findings in
+              [('JavaScript', js_findings), ('Structure', structure_findings),
+               ('Embedded files', embedded_findings), ('Links', link_findings),
+               ('QR', qr_findings)]
+              for error in finding_errors(findings)]
+    if errors:
+        raise ValueError("Incomplete analysis: " + "; ".join(errors))
     scorers = {
         "javascript": lambda: _score_javascript(js_findings),
         "structure": lambda: _score_structure(structure_findings),
         "embedded_files": lambda: _score_embedded(embedded_findings),
-        "links": lambda: _score_links(links),
+        "links": lambda: _score_links(link_findings),
         "qr_codes": lambda: _score_qr(qr_findings),
     }
 
@@ -244,53 +268,13 @@ def compute_risk_score(js_findings=None, structure_findings=None,
     }
 
 
-def analyze_pdf_for_risk(pdf_path):
-    """Run the five risk analyses sharing one open document and one xref
-    sweep instead of re-parsing the file once per analysis."""
-    # Capture timestamps before opening so they can be restored afterwards
-    original_stats = None
-    try:
-        original_stats = os.stat(pdf_path)
-    except Exception:
-        pass
-
-    # On failure the analyzers fall back to opening the file themselves and
-    # report their own errors
-    doc = None
-    xref_cache = None
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception:
-        doc = None
-    if doc is not None:
-        try:
-            xref_cache = build_xref_object_cache(doc)
-        except Exception:
-            xref_cache = None
-
-    try:
-        return compute_risk_score(
-            js_findings=extract_javascript_from_pdf(pdf_path, doc=doc, xref_cache=xref_cache),
-            structure_findings=analyze_structure(pdf_path, doc=doc, xref_cache=xref_cache),
-            embedded_findings=detect_embedded_files(pdf_path, doc=doc, xref_cache=xref_cache),
-            links=extract_links(pdf_path, doc=doc),
-            qr_findings=detect_qr_codes(pdf_path, doc=doc)
-        )
-    finally:
-        if doc is not None:
-            doc.close()
-        if original_stats:
-            try:
-                os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-            except Exception:
-                pass
-
-
 def print_risk_assessment(assessment, max_reasons_per_category=5):
     if not assessment:
         print("No risk assessment available.")
         return
 
+    if assessment.get('coverage'):
+        print_coverage(assessment['coverage'])
     print("\n=== Risk Assessment ===")
     print(f"Overall Risk Score: {assessment['score']}/{assessment['max_score']} "
           f"({assessment['level'].upper()})")
@@ -301,8 +285,9 @@ def print_risk_assessment(assessment, max_reasons_per_category=5):
     for name, category in assessment["categories"].items():
         label = name.replace('_', ' ').title()
         print(f"\n{label}: {category['score']}/{category['max']}")
+        # Reasons quote document values such as hosts and attachment names
         for reason in category["reasons"][:max_reasons_per_category]:
-            print(f"   - {reason}")
+            print(f"   - {safe_text(reason)}")
         remaining = len(category["reasons"]) - max_reasons_per_category
         if remaining > 0:
             print(f"   ... and {remaining} more indicator(s)")

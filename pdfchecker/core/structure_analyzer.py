@@ -1,13 +1,16 @@
 # Structural anomaly detection: flags dangerous PDF constructs that do not
 # depend on JavaScript content, such as auto-run actions, launch actions,
-# XFA forms, name obfuscation and malformed cross-reference structures.
+# XFA forms, name obfuscation, malformed cross-reference structures and data
+# hidden outside the PDF body (polyglot files).
 import logging
+import mmap
 import os
 import re
 
-import fitz
-
-from .utils import build_xref_object_cache
+from .coverage import check_coverage, print_coverage
+from .embedded_file_detector import detect_content_type
+from .pdf_access import document
+from .pdf_objects import Name, decode_name, object_map, open_action_nodes, walk
 
 logger = logging.getLogger(__name__)
 
@@ -38,27 +41,34 @@ _KEY_CHECKS = [
      "JBIG2-compressed stream (historical exploit vector)"),
 ]
 
-_OPEN_ACTION_PATTERN = re.compile(r'/OpenAction(?![0-9A-Za-z])')
-_JS_PATTERN = re.compile(r'/(?:JavaScript|JS)(?![0-9A-Za-z])')
-_EMBEDDED_FILE_PATTERN = re.compile(r'/EmbeddedFile(?![0-9A-Za-z])')
-
 # Raw-byte scan for hex-escaped name tokens (e.g. /J#61vaScript). MuPDF
 # normalizes names when parsing, so evasion attempts are only visible in the
 # raw file. Only names decoding to a risky keyword are flagged, which keeps
 # random matches inside compressed streams out of the results.
-_OBFUSCATED_NAME_PATTERN = re.compile(rb'/([0-9A-Za-z#]*#[0-9A-Fa-f]{2}[0-9A-Za-z#]*)')
+# The token length is bounded (PDF names are <=127 bytes per the spec) so the
+# scan over the whole raw file stays linear and cannot backtrack pathologically.
+_OBFUSCATED_NAME_PATTERN = re.compile(
+    rb'/([0-9A-Za-z#]{0,127}#[0-9A-Fa-f]{2}[0-9A-Za-z#]{0,127})')
 _OBFUSCATION_TARGET_KEYWORDS = frozenset([
     'javascript', 'js', 'launch', 'openaction', 'aa', 'embeddedfile',
     'richmedia', 'xfa', 'uri', 'action', 'gotor', 'gotoe', 'names', 'filespec'
 ])
 
+# Readers skip bytes before the %PDF header and after %%EOF, so those ranges
+# can hold a second file (a PDF/ZIP or PDF/HTA polyglot) without changing how
+# the document renders. Strict readers want the header in the first 1024 bytes.
+HEADER_SEARCH_LIMIT = 1024
+_PDF_HEADER = b'%PDF-'
+_EOF_MARKER = b'%%EOF'
+_PDF_WHITESPACE = re.compile(rb'[\x00\t\n\x0c\r ]*')
+# mshta runs these wherever they appear in a file, not only at its start.
+# The literal '<' prefix keeps the search a fast scan even over large ranges.
+_SCRIPT_MARKUP = re.compile(rb'<(?:script|hta:application)\b', re.IGNORECASE)
+_HTML_START = re.compile(rb'<(?:!doctype\s+html|html|svg)\b', re.IGNORECASE)
+_MAGIC_PROBE_SIZE = 64
 
-def _decode_pdf_name(raw_name):
-    try:
-        text = raw_name.decode('ascii', errors='ignore')
-        return re.sub(r'#([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), text)
-    except Exception:
-        return None
+
+SEVERITIES = ("Critical", "High", "Medium", "Low", "Info")
 
 
 class StructureFindings:
@@ -74,6 +84,9 @@ class StructureFindings:
             "count": 0,
             "locations": []
         })
+        # Instances of one type may differ in severity; report the worst
+        if SEVERITIES.index(severity) < SEVERITIES.index(entry["severity"]):
+            entry["severity"] = severity
         entry["count"] += 1
         if location and len(entry["locations"]) < MAX_LOCATIONS_PER_ANOMALY:
             entry["locations"].append(location)
@@ -83,10 +96,8 @@ class StructureFindings:
             self.errors.append(message)
 
     def to_dict(self):
-        anomalies = sorted(
-            self._anomalies.values(),
-            key=lambda a: ("Critical", "High", "Medium", "Low", "Info").index(a["severity"])
-        )
+        anomalies = sorted(self._anomalies.values(),
+                           key=lambda a: SEVERITIES.index(a["severity"]))
         summary = {}
         for anomaly in anomalies:
             summary[anomaly["severity"]] = summary.get(anomaly["severity"], 0) + 1
@@ -99,48 +110,117 @@ class StructureFindings:
 
 
 def _scan_xref_objects(doc, findings, xref_cache=None):
-    entries = xref_cache if xref_cache is not None else build_xref_object_cache(doc)
-    for xref_num, (obj, error) in entries.items():
-        if error is not None:
-            logger.debug(f"Error reading xref {xref_num}: {error}")
-            continue
-        if not obj:
-            continue
-
-        location = f"XRef {xref_num}"
+    objects = object_map(doc, xref_cache)
+    automatic = open_action_nodes(doc, objects)
+    for xref, obj in objects.items():
+        nodes = list(walk(obj))
+        # Only dictionary keys and name values are syntax; strings are data.
+        names = [str(node) for node in nodes if isinstance(node, Name)]
+        names.extend(key for node in nodes if isinstance(node, dict) for key in node)
+        tokens = set(names)
+        location = f"XRef {xref}"
         for pattern, anomaly_type, severity, description in _KEY_CHECKS:
-            if pattern.search(obj):
+            if any(pattern.fullmatch('/' + name) for name in tokens):
                 findings.add(anomaly_type, severity, description, location)
-
-        if _OPEN_ACTION_PATTERN.search(obj):
-            if _JS_PATTERN.search(obj):
-                findings.add("OpenAction with JavaScript", "High",
-                             "JavaScript executed automatically when the document opens",
-                             location)
-            else:
-                findings.add("OpenAction", "Low",
-                             "Action executed automatically when the document opens",
-                             location)
-
-        if _EMBEDDED_FILE_PATTERN.search(obj):
+        if 'EmbeddedFile' in tokens:
             findings.add("Embedded File Stream", "Low",
-                         "Embedded file stream (see embedded file analysis for details)",
-                         location)
+                         "Embedded file stream (see embedded file analysis for details)", location)
+    catalog = objects.get(doc.pdf_catalog(), {})
+    if isinstance(catalog, dict) and 'OpenAction' in catalog:
+        has_js = any(isinstance(node, dict) and 'JS' in node and id(node) in automatic
+                     for obj in objects.values() for node in walk(obj))
+        findings.add("OpenAction with JavaScript" if has_js else "OpenAction",
+                     "High" if has_js else "Low",
+                     "JavaScript executed automatically when the document opens" if has_js else
+                     "Action executed automatically when the document opens",
+                     f"XRef {doc.pdf_catalog()}")
 
 
-def _scan_raw_obfuscation(pdf_path, findings):
+def _scan_raw_file(pdf_path, findings):
     try:
         with open(pdf_path, 'rb') as f:
-            raw = f.read()
+            if os.fstat(f.fileno()).st_size == 0:
+                return
+            # Scan the file in place rather than allocating a second bytes
+            # object as large as the PDF. A read-only mapping still presents
+            # the exact same byte sequence to the compiled regexes.
+            with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as raw:
+                _collect_obfuscated_names(raw, findings)
+                _check_file_layout(raw, findings)
     except OSError as e:
         findings.add_error(f"Raw scan error: {e}")
-        return
 
+
+def _hidden_content(raw, start, end, known_only=False):
+    """(severity, description, offset) of bytes in raw[start:end] that readers
+    skip, where offset is the first byte after any whitespace, or None when
+    they are only whitespace. With known_only, for ranges that may
+    legitimately hold PDF objects, None unless they start as another
+    recognizable file format."""
+    start = _PDF_WHITESPACE.match(raw, start, end).end()
+    if start >= end:
+        return None
+    head = raw[start:min(end, start + _MAGIC_PROBE_SIZE)]
+    content_type, executable = detect_content_type(head)
+    if content_type is None and _HTML_START.match(head):
+        content_type = "HTML or SVG document"
+    if known_only and content_type is None and not _SCRIPT_MARKUP.match(head):
+        return None
+    if executable:
+        return "Critical", content_type, start
+    if _SCRIPT_MARKUP.search(raw, start, end):
+        return "Critical", (f"{content_type} with script markup" if content_type
+                            else "HTML application or script markup"), start
+    if content_type:
+        return "High", content_type, start
+    return "Medium", "unrecognized content", start
+
+
+def _check_file_layout(raw, findings):
+    header = raw.find(_PDF_HEADER)
+    if not 0 <= header < HEADER_SEARCH_LIMIT:
+        findings.add("Missing PDF Header", "Medium",
+                     f"No %PDF header in the first {HEADER_SEARCH_LIMIT} bytes "
+                     "(strict readers reject the file, lenient ones repair it)")
+    hidden = _hidden_content(raw, 0, header) if header > 0 else None
+    if hidden:
+        severity, content, offset = hidden
+        findings.add("Data Before Header", severity,
+                     "Bytes before the %PDF header, which readers skip; "
+                     "they can hold a second file format (polyglot)",
+                     f"Bytes {offset}-{header - 1}: {content}")
+
+    body = max(header, 0)
+    last = raw.rfind(_EOF_MARKER, body)
+    if last < 0:
+        return
+    description = ("Bytes after an %%EOF marker outside the PDF body; "
+                   "they can hold a second file format (polyglot)")
+    # An earlier %%EOF normally ends a revision and is followed by its
+    # objects, so only a recognizable file is reported there. This catches a
+    # payload appended before a forged final trailer.
+    position = raw.find(_EOF_MARKER, body, last)
+    while position >= 0:
+        start = position + len(_EOF_MARKER)
+        following = raw.find(_EOF_MARKER, start, last)
+        hidden = _hidden_content(raw, start, following if following >= 0 else last,
+                                 known_only=True)
+        if hidden:
+            severity, content, offset = hidden
+            findings.add("Data After EOF", severity, description,
+                         f"Offset {offset}: {content}, before a later %%EOF")
+        position = following
+    hidden = _hidden_content(raw, last + len(_EOF_MARKER), len(raw))
+    if hidden:
+        severity, content, offset = hidden
+        findings.add("Data After EOF", severity, description,
+                     f"Offset {offset}: {len(raw) - offset} bytes, {content}")
+
+
+def _collect_obfuscated_names(raw, findings):
     seen = set()
     for match in _OBFUSCATED_NAME_PATTERN.finditer(raw):
-        decoded = _decode_pdf_name(match.group(1))
-        if not decoded:
-            continue
+        decoded = decode_name(match.group(1).decode('ascii', errors='ignore'))
         normalized = decoded.strip().lower()
         if normalized in _OBFUSCATION_TARGET_KEYWORDS and normalized not in seen:
             seen.add(normalized)
@@ -166,43 +246,22 @@ def _scan_document_structure(doc, findings, xref_cache=None):
         findings.add("No Pages", "Medium", "Document declares zero pages")
 
 
-def analyze_structure(pdf_path, validate_pdf_file=None, doc=None, xref_cache=None):
-    if validate_pdf_file and not validate_pdf_file(pdf_path):
-        return None
-
-    # When the caller passes an already-open document it owns opening,
-    # closing and timestamp restoration
-    original_stats = None
-    if doc is None:
-        try:
-            original_stats = os.stat(pdf_path)
-        except Exception:
-            pass
-
+def analyze_structure(pdf_path, doc=None, xref_cache=None):
     findings = StructureFindings()
     try:
-        if doc is not None:
-            _scan_document_structure(doc, findings, xref_cache)
-        else:
-            with fitz.open(pdf_path) as opened_doc:
-                _scan_document_structure(opened_doc, findings, xref_cache)
-
-        _scan_raw_obfuscation(pdf_path, findings)
-
+        with document(pdf_path, doc) as opened:
+            _scan_document_structure(opened, findings, xref_cache)
+            # Inside the block: reading the raw file must not change its timestamps
+            _scan_raw_file(pdf_path, findings)
     except Exception as e:
         logger.error(f"Error analyzing PDF structure: {str(e)}")
         findings.add_error(f"General structure analysis error: {str(e)}")
-    finally:
-        if original_stats:
-            try:
-                os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-            except Exception:
-                pass
 
     return findings.to_dict()
 
 
 def print_structure_findings(findings):
+    print_coverage({'structure': check_coverage('structure', findings)})
     if not findings:
         print("No structure analysis results available.")
         return

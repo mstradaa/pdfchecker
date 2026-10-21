@@ -1,25 +1,33 @@
 # Bulk (folder) mode: run the selected analysis on every PDF in a directory.
 # Interactive questions are asked once up front, per-file work is parallelized,
-# and VirusTotal calls share a single API budget across all files.
+# and each reputation service shares a single API budget across all files.
+import multiprocessing
 import os
 import re
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
 
-from .config_manager import get_api_key, get_api_limit, ConfigError
 from .embedded_file_detector import detect_embedded_files, print_embedded_findings
-from .hash_checker import calculate_file_hashes, check_virustotal, _print_virustotal_results
+from .hash_checker import calculate_file_hashes
 from .javascript_detector import extract_javascript_from_pdf, print_javascript_findings
-from .link_extractor import LinkExtractor, defang_url, extract_links, remove_protocol
+from .link_extractor import check_qr_urls, defang_url, print_link_list, print_link_summary
 from .metadata_analyzer import analyze_pdf_metadata, print_metadata
-from .qr_detector import detect_qr_codes, print_qr_findings, QR_SUPPORT, QR_UNAVAILABLE_MESSAGE
-from .report_generator import create_report, MAX_OPERATOR_NAME_LENGTH
-from .risk_scorer import analyze_pdf_for_risk
+from .pdf_access import (get_max_file_size_mb, get_password, set_max_file_size_mb,
+                         set_password)
+from .pipeline import analyze_pdf_for_risk
+from .qr_detector import detect_qr_codes, print_qr_findings, qr_supported, QR_UNAVAILABLE_MESSAGE
+from .report_generator import ask_operator_name, create_report
+from .risk_scorer import ranking_key, risk_reasons
 from .structure_analyzer import analyze_structure, print_structure_findings
-from .utils import get_confirmation
+from .threat_intel import check_file, print_call_summary, selected_providers
+from .url_discovery import discover_urls
+from .urlhaus import URLhausClient
+from .utils import get_confirmation, apply_memory_guard
+from .virustotal import VirusTotalClient
 
-MAX_FILE_SIZE_MB = 100
 # fitz keeps whole documents in memory, so cap process workers to bound peak usage
 MAX_PROCESS_WORKERS = 8
 MAX_HASH_THREADS = 16
@@ -29,9 +37,12 @@ MAX_HASH_THREADS = 16
 GENERATED_REPORT_PATTERN = re.compile(r'_report(_\d+)?$')
 
 
-def discover_pdfs(folder_path, max_file_size_mb=MAX_FILE_SIZE_MB, exclude_reports=False):
+def discover_pdfs(folder_path, max_file_size_mb=None, exclude_reports=False):
     valid = []
     skipped = []
+    # Read at call time so a --max-size override applies
+    if max_file_size_mb is None:
+        max_file_size_mb = get_max_file_size_mb()
     max_bytes = max_file_size_mb * 1024 * 1024
 
     with os.scandir(folder_path) as entries:
@@ -45,7 +56,8 @@ def discover_pdfs(folder_path, max_file_size_mb=MAX_FILE_SIZE_MB, exclude_report
                 skipped.append((entry.name, "previously generated report"))
                 continue
             if entry.stat(follow_symlinks=False).st_size > max_bytes:
-                skipped.append((entry.name, f"larger than {max_file_size_mb}MB"))
+                skipped.append((entry.name, f"larger than {max_file_size_mb}MB "
+                                            "(raise it with --max-size)"))
                 continue
             valid.append(entry.path)
 
@@ -79,59 +91,11 @@ def run_bulk_analysis(folder_path, operation_label, bulk_handler, exclude_report
 # Parallel execution
 # ---------------------------------------------------------------------------
 
-# Workers must be module-level so ProcessPoolExecutor can pickle them
+# Workers must be module-level functions so they can be pickled into the
+# worker processes
 
-def _hash_worker(pdf_path):
-    return calculate_file_hashes(pdf_path)
-
-
-def _links_worker(pdf_path):
-    return extract_links(pdf_path)
-
-
-def _metadata_worker(pdf_path):
-    try:
-        original_stats = os.stat(pdf_path)
-    except OSError:
-        original_stats = None
-
-    metadata = analyze_pdf_metadata(pdf_path, file_stats=original_stats)
-
-    if original_stats:
-        try:
-            os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-        except OSError:
-            pass
-
-    # fitz objects (e.g. page rects) are not reliably picklable across processes
-    if metadata and metadata.get("page_info"):
-        metadata["page_info"] = {k: str(v) for k, v in metadata["page_info"].items()}
-    return metadata
-
-
-def _javascript_worker(pdf_path):
-    return extract_javascript_from_pdf(pdf_path)
-
-
-def _structure_worker(pdf_path):
-    return analyze_structure(pdf_path)
-
-
-def _embedded_worker(pdf_path):
-    return detect_embedded_files(pdf_path)
-
-
-def _qr_worker(pdf_path):
-    return detect_qr_codes(pdf_path)
-
-
-def _risk_worker(pdf_path):
-    return analyze_pdf_for_risk(pdf_path)
-
-
-def _report_worker(pdf_path, defang, operator_name, include_logo=True):
-    report_path = create_report(pdf_path, check_virustotal=False, defang=defang,
-                                operator_name=operator_name, include_logo=include_logo)
+def _report_worker(pdf_path, defang, operator_name, providers=(), include_logo=True):
+    report_path = create_report(pdf_path, defang, operator_name, providers, include_logo)
     if not report_path:
         raise RuntimeError("report generation failed")
     return report_path
@@ -140,33 +104,95 @@ def _report_worker(pdf_path, defang, operator_name, include_logo=True):
 # Run worker over all files; returns {path: (ok, result_or_error_message)}.
 # Threads suit hashing (hashlib/file IO release the GIL); PyMuPDF is not
 # thread-safe, so fitz-based workers run in separate processes instead.
-def _run_parallel(files, worker, use_processes):
-    if len(files) == 1:
+def _isolated_child(connection, worker, path, initializer, password, max_file_size_mb):
+    # Children start from the forkserver's or a fresh interpreter's module
+    # state, so the parent's settings are passed in explicitly
+    set_password(password)
+    set_max_file_size_mb(max_file_size_mb)
+    try:
+        # Keep machine-readable stdout clean in spawned children too.
+        sys.stdout = sys.stderr
+        if initializer:
+            initializer()
+        connection.send((True, worker(path)))
+    except Exception as exc:
+        connection.send((False, str(exc) or type(exc).__name__))
+    finally:
+        connection.close()
+        set_password(None)
+
+
+_process_context = None
+_process_context_lock = threading.Lock()
+
+
+# Every file gets a fresh process. A forkserver forks it from a server that
+# has the analyzers imported already, about 3x cheaper than starting a new
+# interpreter; spawn remains the fallback where the platform has no
+# forkserver or forbids its Unix socket (Windows, some sandboxes).
+def _worker_context():
+    global _process_context
+    with _process_context_lock:
+        if _process_context is None:
+            _process_context = multiprocessing.get_context('spawn')
+            if 'forkserver' in multiprocessing.get_all_start_methods():
+                # Imported here: the module only exists for POSIX start methods
+                from multiprocessing import forkserver
+                context = multiprocessing.get_context('forkserver')
+                context.set_forkserver_preload([__name__])
+                try:
+                    forkserver.ensure_running()
+                except Exception:
+                    pass
+                else:
+                    _process_context = context
+        return _process_context
+
+
+def _isolated_call(worker, path, initializer):
+    context = _worker_context()
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(target=_isolated_child,
+                              args=(sending, worker, path, initializer, get_password(),
+                                    get_max_file_size_mb()))
+    try:
+        process.start()
+        sending.close()
         try:
-            return {files[0]: (True, worker(files[0]))}
-        except Exception as e:
-            return {files[0]: (False, str(e))}
+            return receiving.recv()
+        except EOFError:
+            process.join()
+            return False, f"Analysis worker exited without a result (exit code {process.exitcode})"
+    finally:
+        receiving.close()
+        sending.close()
+        if process.pid is not None:
+            process.join()
+            process.close()
 
-    if use_processes:
-        executor_cls = ProcessPoolExecutor
-        max_workers = min(len(files), os.cpu_count() or 2, MAX_PROCESS_WORKERS)
-    else:
-        executor_cls = ThreadPoolExecutor
-        max_workers = min(len(files), MAX_HASH_THREADS)
 
+def _run_parallel(files, worker, use_processes, process_initializer=apply_memory_guard,
+                  max_workers=None):
+    if not files:
+        return {}
+    if max_workers is None:
+        max_workers = (min(len(files), os.cpu_count() or 2, MAX_PROCESS_WORKERS) if use_processes
+                       else min(len(files), MAX_HASH_THREADS))
     results = {}
-    total = len(files)
-    with executor_cls(max_workers=max_workers) as pool:
-        futures = {pool.submit(worker, path): path for path in files}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        if use_processes:
+            futures = {pool.submit(_isolated_call, worker, path, process_initializer): path
+                       for path in files}
+        else:
+            futures = {pool.submit(worker, path): path for path in files}
         for done, future in enumerate(as_completed(futures), 1):
             path = futures[future]
             try:
-                results[path] = (True, future.result())
-                status = "done"
-            except Exception as e:
-                results[path] = (False, str(e))
-                status = f"failed ({e})"
-            print(f"  [{done}/{total}] {Path(path).name}: {status}")
+                results[path] = future.result() if use_processes else (True, future.result())
+            except Exception as exc:
+                results[path] = False, str(exc)
+            status = "done" if results[path][0] else f"failed ({results[path][1]})"
+            print(f"  [{done}/{len(files)}] {Path(path).name}: {status}")
     return results
 
 
@@ -174,264 +200,99 @@ def _run_parallel(files, worker, use_processes):
 # Bulk operations
 # ---------------------------------------------------------------------------
 
-def _get_vt_session():
-    try:
-        success, api_key = get_api_key()
-    except ConfigError as e:
-        print(f"Warning: Could not access VirusTotal API key: {e}")
-        return None, 0
-
-    if not success or not api_key:
-        return None, 0
-
-    limit_success, api_limit = get_api_limit()
-    if not limit_success:
-        print("Warning: Could not retrieve API limit, using default limit.")
-    return api_key, api_limit
-
-
-def bulk_hash_check(files):
-    api_key, api_limit = _get_vt_session()
-    check_vt = False
-    if api_key:
-        check_vt = get_confirmation("\nWould you like to check these files with VirusTotal?")
-    else:
-        print("\nVirusTotal API key not found. Hashes will be calculated without VirusTotal checks.")
-
-    print(f"\nCalculating hashes for {len(files)} files...")
-    results = _run_parallel(files, _hash_worker, use_processes=False)
-
-    vt_calls = 0
+# Print each file's result in folder order, or its error
+def _print_results(files, results, printer):
     for pdf_path in files:
         ok, payload = results[pdf_path]
         print(f"\n=== {Path(pdf_path).name} ===")
-        if not ok:
+        if ok:
+            printer(payload)
+        else:
             print(f"Error: {payload}")
-            continue
 
-        for hash_type, hash_value in payload.items():
-            print(f"{hash_type}: {hash_value}")
 
-        if check_vt:
-            if vt_calls >= api_limit:
-                print("VirusTotal check skipped: API call limit reached.")
-                continue
-            vt_calls += 1
-            result = check_virustotal(payload['SHA-256'], silent=True)
-            if result:
-                stats = result.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-                _print_virustotal_results(stats)
-            else:
-                print("VirusTotal: hash not found or request failed.")
+def _analyze_and_print(files, description, worker, printer):
+    print(f"\n{description} {len(files)} files...")
+    _print_results(files, _run_parallel(files, worker, use_processes=True), printer)
 
-    if check_vt:
-        print(f"\nTotal VirusTotal API calls made: {vt_calls}")
+
+def bulk_hash_check(files):
+    with selected_providers("these files", VirusTotalClient(), URLhausClient()) as providers:
+        print(f"\nCalculating hashes for {len(files)} files...")
+        results = _run_parallel(files, calculate_file_hashes, use_processes=False)
+
+        def print_hashes(hashes):
+            for hash_type, hash_value in hashes.items():
+                print(f"{hash_type}: {hash_value}")
+            check_file(providers, hashes['SHA-256'])
+
+        _print_results(files, results, print_hashes)
+        print_call_summary(providers)
 
 
 def bulk_link_extraction(files):
     defanged = get_confirmation("Do you want to display links in defanged format?")
 
-    # One extractor for the whole batch: the API limit is enforced globally and
-    # a URL appearing in several PDFs is only checked once
-    extractor = LinkExtractor()
-    check_vt = False
-    if extractor._initialize_api_config() and extractor.api_key:
-        check_vt = get_confirmation("\nWould you like to check the extracted links with VirusTotal?")
-    else:
-        print("\nVirusTotal API key not found. Links will be listed without checking.")
+    # One client per service for the whole batch: the API limit is enforced
+    # globally and a URL appearing in several PDFs is only checked once
+    with selected_providers("the extracted links", VirusTotalClient(), URLhausClient()) as providers:
+        print(f"\nExtracting links from {len(files)} files...")
+        results = _run_parallel(files, discover_urls, use_processes=True)
 
-    print(f"\nExtracting links from {len(files)} files...")
-    results = _run_parallel(files, _links_worker, use_processes=True)
+        def print_links(findings):
+            print_link_list(print_link_summary(findings), defanged, providers)
 
-    checked_count = 0
-    skipped_count = 0
-    duplicate_count = 0
-    try:
-        for pdf_path in files:
-            ok, links = results[pdf_path]
-            print(f"\n=== {Path(pdf_path).name} ===")
-            if not ok:
-                print(f"Error: {links}")
-                continue
-            if not links:
-                print("No links found.")
-                continue
-
-            print(f"{len(links)} unique links found.")
-            for i, link in enumerate(links, 1):
-                display_link = defang_url(link) if defanged else remove_protocol(link)
-                print(f"{i}. {display_link}")
-
-                if not check_vt:
-                    continue
-
-                if link in extractor.checked_urls:
-                    print("   URL already checked in this bulk operation.")
-                    duplicate_count += 1
-                    continue
-
-                if extractor.api_calls_made >= extractor.api_limit:
-                    print("   Skipped due to API limit.")
-                    skipped_count += 1
-                    continue
-
-                print("   Checking with VirusTotal...")
-                result = extractor.check_link_virustotal(link)
-                if result:
-                    checked_count += 1
-                    _print_url_vt_result(result)
-                else:
-                    print("   VirusTotal check failed. Please check your API key or try again later.")
-
-        if check_vt:
-            print(f"\nAPI Call Summary:")
-            print(f"- Links checked with VirusTotal: {checked_count}")
-            if duplicate_count > 0:
-                print(f"- Duplicate links skipped: {duplicate_count}")
-            if skipped_count > 0:
-                print(f"- Links skipped due to API limit: {skipped_count}")
-            print(f"- Total API calls made: {extractor.api_calls_made}")
-    finally:
-        extractor.reset()
-
-
-def _print_url_vt_result(result):
-    attrs = result.get("data", {}).get("attributes", {})
-    if attrs.get("status") not in (None, "completed"):
-        print("   VirusTotal analysis still pending; try again later for results.")
-        return
-    stats = attrs.get("stats", {})
-    print("   VirusTotal Results:")
-    print(f"   - Harmless: {stats.get('harmless', 0)}")
-    print(f"   - Malicious: {stats.get('malicious', 0)}")
-    print(f"   - Suspicious: {stats.get('suspicious', 0)}")
-    print(f"   - Undetected: {stats.get('undetected', 0)}")
+        _print_results(files, results, print_links)
+        print_call_summary(providers)
 
 
 def bulk_metadata_analysis(files):
-    print(f"\nAnalyzing metadata for {len(files)} files...")
-    results = _run_parallel(files, _metadata_worker, use_processes=True)
-
-    for pdf_path in files:
-        ok, metadata = results[pdf_path]
-        print(f"\n=== {Path(pdf_path).name} ===")
-        if not ok:
-            print(f"Error: {metadata}")
-        elif not metadata:
-            print("Error analyzing PDF metadata.")
-        else:
-            print_metadata(metadata)
+    _analyze_and_print(files, "Analyzing metadata for", analyze_pdf_metadata, print_metadata)
 
 
 def bulk_javascript_analysis(files):
-    print(f"\nAnalyzing JavaScript in {len(files)} files...")
-    results = _run_parallel(files, _javascript_worker, use_processes=True)
-
-    for pdf_path in files:
-        ok, findings = results[pdf_path]
-        print(f"\n=== {Path(pdf_path).name} ===")
-        if not ok:
-            print(f"Error: {findings}")
-        else:
-            print_javascript_findings(findings)
+    _analyze_and_print(files, "Analyzing JavaScript in", extract_javascript_from_pdf,
+                       print_javascript_findings)
 
 
 def bulk_structure_analysis(files):
-    print(f"\nAnalyzing structure of {len(files)} files...")
-    results = _run_parallel(files, _structure_worker, use_processes=True)
-
-    for pdf_path in files:
-        ok, findings = results[pdf_path]
-        print(f"\n=== {Path(pdf_path).name} ===")
-        if not ok:
-            print(f"Error: {findings}")
-        else:
-            print_structure_findings(findings)
+    _analyze_and_print(files, "Analyzing structure of", analyze_structure,
+                       print_structure_findings)
 
 
 def bulk_embedded_analysis(files):
-    print(f"\nDetecting embedded files in {len(files)} files...")
-    print("Note: extraction to disk is available in single-file mode only.")
-    results = _run_parallel(files, _embedded_worker, use_processes=True)
-
-    for pdf_path in files:
-        ok, findings = results[pdf_path]
-        print(f"\n=== {Path(pdf_path).name} ===")
-        if not ok:
-            print(f"Error: {findings}")
-        else:
-            print_embedded_findings(findings)
+    _analyze_and_print(files, "Detecting embedded files in", detect_embedded_files,
+                       print_embedded_findings)
+    print("\nNote: extraction to disk is available in single-file mode only.")
 
 
 def bulk_qr_analysis(files):
-    if not QR_SUPPORT:
+    if not qr_supported():
         print(f"\n{QR_UNAVAILABLE_MESSAGE}")
         return
 
     defanged = get_confirmation("Do you want to display QR URLs in defanged format?")
 
-    # Same shared-budget model as bulk link extraction: one extractor for the
-    # whole batch, and a URL appearing in several PDFs is only checked once
-    extractor = LinkExtractor()
-    check_vt = False
-    if extractor._initialize_api_config() and extractor.api_key:
-        check_vt = get_confirmation("\nWould you like to check decoded QR URLs with VirusTotal?")
-    else:
-        print("\nVirusTotal API key not found. QR payloads will be listed without checking.")
+    # Same shared-budget model as bulk link extraction
+    with selected_providers("decoded QR URLs", VirusTotalClient(), URLhausClient()) as providers:
+        print(f"\nScanning {len(files)} files for QR codes...")
+        results = _run_parallel(files, detect_qr_codes, use_processes=True)
 
-    print(f"\nScanning {len(files)} files for QR codes...")
-    results = _run_parallel(files, _qr_worker, use_processes=True)
-
-    try:
-        for pdf_path in files:
-            ok, findings = results[pdf_path]
-            print(f"\n=== {Path(pdf_path).name} ===")
-            if not ok:
-                print(f"Error: {findings}")
-                continue
-
+        def print_qr(findings):
             print_qr_findings(findings, defanged=defanged, defang_url=defang_url)
+            check_qr_urls(findings, defanged, providers)
 
-            if not check_vt or not findings:
-                continue
-            for qr in findings.get("qr_codes", []):
-                if qr["type"] != "URL":
-                    continue
-                url = qr["payload"]
-                display_url = defang_url(url) if defanged else url
-                if url in extractor.checked_urls:
-                    print(f"\n{display_url}: already checked in this bulk operation.")
-                    continue
-                if extractor.api_calls_made >= extractor.api_limit:
-                    print(f"\n{display_url}: skipped due to API limit.")
-                    continue
-                print(f"\nChecking QR URL with VirusTotal: {display_url}")
-                result = extractor.check_link_virustotal(url)
-                if result:
-                    _print_url_vt_result(result)
-                else:
-                    print("   VirusTotal check failed. Please check your API key or try again later.")
-
-        if check_vt:
-            print(f"\nTotal API calls made: {extractor.api_calls_made}")
-    finally:
-        extractor.reset()
+        _print_results(files, results, print_qr)
+        print_call_summary(providers)
 
 
 def bulk_risk_scoring(files):
     print(f"\nComputing risk scores for {len(files)} files...")
-    results = _run_parallel(files, _risk_worker, use_processes=True)
+    results = _run_parallel(files, analyze_pdf_for_risk, use_processes=True)
 
     # Rank by score so the riskiest files surface first
-    scored = []
-    failed = []
-    for pdf_path in files:
-        ok, assessment = results[pdf_path]
-        if ok and assessment:
-            scored.append((pdf_path, assessment))
-        else:
-            failed.append((pdf_path, assessment))
-    scored.sort(key=lambda item: item[1]["score"], reverse=True)
+    scored = sorted(((path, results[path][1]) for path in files if all(results[path])),
+                    key=lambda item: ranking_key(item[1]))
 
     print("\n=== Risk Ranking ===")
     for pdf_path, assessment in scored:
@@ -439,50 +300,34 @@ def bulk_risk_scoring(files):
               f"{assessment['level'].upper():8s} {Path(pdf_path).name}")
         for adjustment in assessment.get("adjustments", []):
             print(f"      NOTE: {adjustment}")
-        top_reasons = [reason for category in assessment["categories"].values()
-                       for reason in category["reasons"]]
-        for reason in top_reasons[:3]:
+        reasons = risk_reasons(assessment)
+        for reason in reasons[:3]:
             print(f"      - {reason}")
-        if len(top_reasons) > 3:
-            print(f"      ... and {len(top_reasons) - 3} more indicator(s)")
+        if len(reasons) > 3:
+            print(f"      ... and {len(reasons) - 3} more indicator(s)")
 
-    for pdf_path, error in failed:
-        print(f"\n[ERROR] {Path(pdf_path).name}: {error}")
+    for pdf_path in files:
+        if not all(results[pdf_path]):
+            print(f"\n[ERROR] {Path(pdf_path).name}: {results[pdf_path][1]}")
 
 
 def bulk_report_generation(files):
-    try:
-        operator_name = input("\nPlease type your name (enter to skip): ").strip()[:MAX_OPERATOR_NAME_LENGTH]
-    except (EOFError, KeyboardInterrupt):
-        print("\nOperation cancelled.")
+    operator_name = ask_operator_name()
+    if operator_name is None:
         return
 
-    api_key, _ = _get_vt_session()
-    check_vt = False
-    if api_key:
-        check_vt = get_confirmation("\nWould you like to check elements with VirusTotal?")
+    with selected_providers("elements", VirusTotalClient(), URLhausClient()) as providers:
+        defang = get_confirmation("\nWould you like to defang URLs?")
 
-    defang = get_confirmation("\nWould you like to defang URLs?")
+        include_logo = get_confirmation("\nWould you like to include the logo in the reports?")
 
-    include_logo = get_confirmation("\nWould you like to include the logo in the reports?")
-
-    print(f"\nGenerating reports for {len(files)} files...")
-    if check_vt:
-        # VirusTotal calls share one API budget and are rate limited, so
-        # reports run sequentially with a single shared link checker
-        link_checker = LinkExtractor()
-        link_checker._initialize_api_config()
-        results = {}
-        for i, pdf_path in enumerate(files, 1):
-            print(f"  [{i}/{len(files)}] {Path(pdf_path).name}...")
-            report_path = create_report(pdf_path, check_virustotal=True, defang=defang,
-                                        operator_name=operator_name, link_checker=link_checker,
-                                        include_logo=include_logo)
-            results[pdf_path] = (report_path is not None, report_path or "report generation failed")
-    else:
+        print(f"\nGenerating reports for {len(files)} files...")
         worker = partial(_report_worker, defang=defang, operator_name=operator_name,
-                         include_logo=include_logo)
-        results = _run_parallel(files, worker, use_processes=True)
+                         providers=providers, include_logo=include_logo)
+        # Enrichment calls share per-service budgets across the batch, so those
+        # reports run one at a time in this process with the shared clients.
+        results = _run_parallel(files, worker, use_processes=not providers,
+                                max_workers=1 if providers else None)
 
     generated = 0
     print()

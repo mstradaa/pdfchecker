@@ -1,247 +1,246 @@
+import copy
+import io
 import os
 from pathlib import Path
 from datetime import datetime, timezone
 
 import fitz
 
-from .hash_checker import calculate_file_hashes, check_virustotal as check_vt_hash
-from .link_extractor import extract_links, defang_url, LinkExtractor
-from .metadata_analyzer import analyze_pdf_metadata
-from .javascript_detector import extract_javascript_from_pdf
-from .structure_analyzer import analyze_structure
-from .embedded_file_detector import detect_embedded_files
-from .qr_detector import detect_qr_codes, QR_UNAVAILABLE_MESSAGE
-from .risk_scorer import compute_risk_score
-from .config_manager import get_api_key, ConfigError
-from .utils import get_confirmation, build_xref_object_cache
-from .report_html import build_report_html
+from .. import __version__
+from .coverage import print_coverage
+from .hash_checker import calculate_file_hashes
+from .link_extractor import defang_url
+from .pipeline import analyze_pdf_once
+from .report_html import (BORDER, CSS, MUTED, PAGE_MARGIN, build_footer_text,
+                          build_report_html, report_images)
+from .risk_scorer import risk_level
+from .threat_intel import selected_providers
+from .urlhaus import URLhausClient
+from .utils import get_confirmation
+from .virustotal import VirusTotalClient
 
-PDFCHECKER_VERSION = "1.0"
 MAX_OPERATOR_NAME_LENGTH = 100
 
+_BOTTOM_MARGIN = 58
+_FOOTER_FONT_SIZE = 7.5
+_BLOCK_ID = "block-%d"
+# Height of the endless page the report is measured on (points)
+_MEASURE_HEIGHT = 1e6
 
-class PDFAnalysisResult:
-    def __init__(self):
-        self.hashes = None
-        self.links = None
-        self.metadata = None
-        self.javascript = None
-        self.structure = None
-        self.embedded = None
-        self.qr = None
-        self.risk = None
-        self.errors = []
 
-def analyze_pdf_once(pdf_path, validate_pdf_file=None):
-    result = PDFAnalysisResult()
-    original_stats = None
+def _rgb(color):
+    """'#rrggbb' -> PyMuPDF colour tuple."""
+    return tuple(int(color[i:i + 2], 16) / 255 for i in (1, 3, 5))
 
+
+def _story(body_html, archive, breaks=frozenset()):
+    """A Story of the report with an id on every top-level block and a page
+    break before each block whose index is in `breaks`. Also returns, per
+    block, whether it is kept with the next one (headings, table headers and
+    the lines introducing a table)."""
+    story = fitz.Story(html=body_html, user_css=CSS, archive=archive)
+    keeps = []
+    node = story.body.first_child
+    while node:
+        if not node.is_text:
+            index = len(keeps)
+            # get_attributes(), not get_attribute_value(): PyMuPDF hangs
+            # looking up a missing attribute on a node that has any attribute
+            keeps.append(node.tagname in ("h2", "h3")
+                         or "keep" in node.get_attributes().get("class", "").split())
+            if index in breaks:
+                # Tables ignore page-break-before, so break on an empty div
+                marker = story.body.create_element("div")
+                marker.set_attribute("style", "page-break-before: always")
+                node.insert_before(marker)
+            node.set_attribute("id", _BLOCK_ID % index)
+        node = node.next
+    return story, keeps
+
+
+def _keep_breaks(body_html, archive, content):
+    """Indices of the blocks to start a new page at, so that no keep-with-next
+    block ends a page apart from the content it introduces (fitz.Story ignores
+    page-break-after: avoid). The report is laid out once on an endless page,
+    where every block position is exact, and paginated the way Story does it:
+    a block that does not fit moves whole to the next page."""
+    story, keeps = _story(body_html, archive)
+    story.place(fitz.Rect(content.x0, content.y0, content.x1, content.y0 + _MEASURE_HEIGHT))
+    ids = {_BLOCK_ID % index: index for index in range(len(keeps))}
+    spans = [None] * len(keeps)
+
+    def record(position):
+        index = ids.get(position.id)
+        if index is not None and spans[index] is None:
+            spans[index] = (position.rect[1], position.rect[3])
+
+    story.element_positions(record)
+    # Story cannot break a table row across pages and silently drops whatever
+    # overflows one; the template caps content to prevent it, so fail loudly
+    # rather than emit a report with sections missing
+    if any(span and span[1] - span[0] > content.height for span in spans):
+        raise ValueError("report content too tall to fit on a page")
+
+    breaks = set()
+    first, index = 0, 1     # first block on the current page, block to place
+    while index < len(keeps) and spans[index] and spans[first]:
+        if spans[index][1] - spans[first][0] <= content.height:
+            index += 1
+            continue
+        start = index
+        while start - 1 > first and keeps[start - 1]:
+            start -= 1
+        if start < index:
+            breaks.add(start)
+        first, index = start, start + 1
+    return breaks
+
+
+def _render_html_to_pdf(body_html, meta, output_path):
+    """Render the report HTML to a PDF with PyMuPDF's Story engine and stamp a
+    page-numbered footer once the total page count is known."""
+    mediabox = fitz.paper_rect("a4")
+    content = fitz.Rect(PAGE_MARGIN, PAGE_MARGIN,
+                        mediabox.x1 - PAGE_MARGIN, mediabox.y1 - _BOTTOM_MARGIN)
+    # Images are served from memory, so the renderer never dereferences a
+    # filesystem path named in the HTML
+    archive = fitz.Archive()
+    for name, data in report_images().items():
+        archive.add((data, name))
+
+    story, _ = _story(body_html, archive, _keep_breaks(body_html, archive, content))
+    buffer = io.BytesIO()
+    writer = fitz.DocumentWriter(buffer)
+    more = 1
+    while more:
+        device = writer.begin_page(mediabox)
+        more, _ = story.place(content)
+        story.draw(device)
+        writer.end_page()
+    writer.close()
+
+    doc = fitz.open("pdf", buffer.getvalue())
     try:
-        original_stats = os.stat(pdf_path)
-    except Exception as e:
-        result.errors.append(f"Analysis error: {str(e)}")
-        return result
-
-    try:
-        result.hashes = calculate_file_hashes(pdf_path)
-    except Exception as e:
-        result.errors.append(f"Hash calculation error: {str(e)}")
-
-    # One open document and one xref sweep shared by every analysis; on
-    # failure the analyzers fall back to opening the file themselves and
-    # report their own errors
-    doc = None
-    xref_cache = None
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception:
-        doc = None
-    if doc is not None:
-        try:
-            xref_cache = build_xref_object_cache(doc)
-        except Exception:
-            xref_cache = None
-
-    # Each analysis is isolated so one failure does not lose the rest of
-    # the report
-    content_analyses = [
-        ('metadata', lambda: analyze_pdf_metadata(
-            pdf_path, validate_pdf_file=validate_pdf_file,
-            file_stats=original_stats, doc=doc)),
-        ('links', lambda: extract_links(pdf_path, doc=doc)),
-        ('javascript', lambda: extract_javascript_from_pdf(
-            pdf_path, validate_pdf_file=validate_pdf_file,
-            doc=doc, xref_cache=xref_cache)),
-        ('structure', lambda: analyze_structure(pdf_path, doc=doc, xref_cache=xref_cache)),
-        ('embedded', lambda: detect_embedded_files(pdf_path, doc=doc, xref_cache=xref_cache)),
-        ('qr', lambda: detect_qr_codes(pdf_path, doc=doc)),
-    ]
-    try:
-        for attr, analysis in content_analyses:
-            try:
-                setattr(result, attr, analysis())
-            except Exception as e:
-                result.errors.append(f"{attr} analysis error: {str(e)}")
+        page_count = doc.page_count
+        footer_y = mediabox.y1 - 30
+        for index, page in enumerate(doc, 1):
+            page.draw_line(fitz.Point(PAGE_MARGIN, footer_y - 6),
+                           fitz.Point(mediabox.x1 - PAGE_MARGIN, footer_y - 6),
+                           color=_rgb(BORDER), width=0.6)
+            left, right = build_footer_text(meta, index, page_count)
+            right_x = (mediabox.x1 - PAGE_MARGIN
+                       - fitz.get_text_length(right, "helv", _FOOTER_FONT_SIZE))
+            for x, text in ((PAGE_MARGIN, left), (right_x, right)):
+                page.insert_text(fitz.Point(x, footer_y), text,
+                                 fontsize=_FOOTER_FONT_SIZE, fontname="helv",
+                                 color=_rgb(MUTED))
+        doc.save(str(output_path))
     finally:
-        if doc is not None:
-            doc.close()
-        if original_stats:
-            try:
-                os.utime(pdf_path, (original_stats.st_atime, original_stats.st_mtime))
-            except Exception:
-                pass
-
-    result.risk = compute_risk_score(
-        js_findings=result.javascript,
-        structure_findings=result.structure,
-        embedded_findings=result.embedded,
-        links=result.links,
-        qr_findings=result.qr
-    )
-
-    return result
+        doc.close()
 
 
-def _vt_scan_date(attrs):
-    last_scan_date = attrs.get("last_analysis_date")
-    if last_scan_date:
-        try:
-            scan_datetime = datetime.fromtimestamp(last_scan_date, tz=timezone.utc)
-            return scan_datetime.strftime('%Y-%m-%d %H:%M:%S')
-        except (ValueError, TypeError):
-            pass
-    return None
-
-# condense the VirusTotal hash lookup into template-ready data
-def summarize_virustotal_file(vt_report):
-    attrs = (vt_report or {}).get("data", {}).get("attributes", {})
-    stats = attrs.get("last_analysis_stats", {})
-    total = sum(stats.values())
-    if total == 0:
-        return {"status": "not_found"}
-
-    positives = stats.get("malicious", 0) + stats.get("suspicious", 0)
-    detections = [
-        (scanner, scan_result.get('result', 'Unknown'))
-        for scanner, scan_result in attrs.get("last_analysis_results", {}).items()
-        if scan_result.get("category") in ("malicious", "suspicious")
-    ]
-    return {
-        "status": "ok",
-        "positives": positives,
-        "total": total,
-        "detections": detections,
-        "scan_date": _vt_scan_date(attrs),
-    }
-
-# condense a VirusTotal URL analysis into template-ready data
-def summarize_virustotal_url(vt_result):
-    if not vt_result:
-        return {"status": "error"}
-
-    attrs = vt_result.get("data", {}).get("attributes", {})
-    if attrs.get("status") not in (None, "completed"):
-        return {"status": "pending"}
-
-    stats = attrs.get("stats", {})
-    if sum(stats.values()) == 0:
-        return {"status": "not_found"}
-
-    return {
-        "status": "ok",
-        "stats": {
-            "harmless": stats.get("harmless", 0),
-            "malicious": stats.get("malicious", 0),
-            "suspicious": stats.get("suspicious", 0),
-            "undetected": stats.get("undetected", 0),
-        },
-        "scan_date": _vt_scan_date(attrs),
-    }
+def _service(providers, provider):
+    return next((client for client in providers if client.provider == provider), None)
 
 
-def _check_url_virustotal(link_checker, url):
-    if url in link_checker.checked_urls:
-        return {"status": "skipped",
-                "message": "URL already checked in this operation."}
-    if link_checker.api_calls_made >= link_checker.api_limit:
-        return {"status": "skipped",
-                "message": "VirusTotal API call limit reached."}
-    return summarize_virustotal_url(link_checker.check_link_virustotal(url))
+# Report cell for one lookup: a summary, why it was skipped, or None when the
+# service is not in use
+def _reputation(client, value, file=False):
+    if client is None:
+        return None
+    if file:
+        value = value.lower()
+        reason = client.skip_reason(value, client.checked_hashes, noun="File hash")
+    else:
+        reason = client.skip_reason(value, client.checked_urls)
+    if reason:
+        return {"status": "skipped", "message": reason}
+    if file:
+        return client.summarize_file(client.check_file(value, silent=True))
+    return client.summarize_url(client.check_url(value, silent=True))
 
 
-# Gather everything the HTML template needs, running the VirusTotal lookups
-# (file hash first, then links, then QR URLs) against the shared call limit
-def _collect_report_data(pdf_path, analysis_result, check_virustotal, defang,
-                         operator_name, link_checker, include_logo=True):
-    vt_file = None
-    if check_virustotal and analysis_result.hashes:
-        sha256 = analysis_result.hashes.get("SHA-256")
-        if sha256:
-            if link_checker.consume_api_call():
-                vt_file = summarize_virustotal_file(
-                    check_vt_hash(sha256, silent=True))
-            else:
-                vt_file = {"status": "skipped",
-                           "message": "VirusTotal API call limit reached."}
+# Gather everything the HTML template needs, running each service's lookups
+# (file hash first, then links, then QR URLs) against its own shared call limit.
+def _collect_report_data(pdf_path, analysis_result, defang, operator_name,
+                         providers=(), include_logo=True):
+    vt = _service(providers, "virustotal")
+    urlhaus = _service(providers, "urlhaus")
 
-    links = []
-    for link in (analysis_result.links or []):
-        entry = {
-            "url": link,
-            "display": defang_url(link) if defang else link,
-            "vt": None,
-        }
-        if check_virustotal:
-            entry["vt"] = _check_url_virustotal(link_checker, link)
-        links.append(entry)
+    def lookups(url):
+        return {"vt": _reputation(vt, url), "urlhaus": _reputation(urlhaus, url)}
+
+    sha256 = (analysis_result.hashes or {}).get("SHA-256")
+    vt_file = _reputation(vt, sha256, file=True) if sha256 else None
+    urlhaus_file = _reputation(urlhaus, sha256, file=True) if sha256 else None
+
+    links = [dict(url=link, display=defang_url(link) if defang else link, **lookups(link))
+             for link in analysis_result.links or []]
 
     qr = None
     if analysis_result.qr:
         qr = dict(analysis_result.qr)
         qr_codes = []
         for qr_code in qr.get('qr_codes', []):
-            entry = dict(qr_code)
-            payload = entry.get('payload', '')
-            is_url = entry.get('type') == 'URL'
-            entry['display'] = defang_url(payload) if (is_url and defang) else payload
-            entry['vt'] = None
-            if check_virustotal and is_url:
-                entry['vt'] = _check_url_virustotal(link_checker, payload)
+            payload = qr_code.get('payload', '')
+            is_url = qr_code.get('type') == 'URL'
+            entry = dict(qr_code, display=defang_url(payload) if (is_url and defang) else payload,
+                         vt=None, urlhaus=None)
+            if is_url:
+                entry.update(lookups(payload))
             qr_codes.append(entry)
         qr['qr_codes'] = qr_codes
 
+    risk = copy.deepcopy(analysis_result.risk)
+    intel = []
+    if vt_file and vt_file.get('status') == 'ok' and vt_file.get('positives', 0):
+        intel.append("VirusTotal flagged the file")
+    if urlhaus_file and urlhaus_file.get('status') == 'ok':
+        intel.append("URLhaus identifies a known malware payload")
+    for entry in links + (qr.get('qr_codes', []) if qr else []):
+        vt_url = entry.get('vt') or {}
+        stats = vt_url.get('stats', {})
+        if vt_url.get('status') == 'ok' and (stats.get('malicious', 0) or stats.get('suspicious', 0)):
+            intel.append("VirusTotal flagged a URL")
+        if (entry.get('urlhaus') or {}).get('status') == 'ok':
+            intel.append("URLhaus identifies a known malware URL")
+    if risk is not None and intel:
+        risk['score'] = max(risk['score'], 80)
+        risk['level'] = risk_level(risk['score'])
+        risk['adjustments'].extend(reason + ": minimum score 80 (Critical)"
+                                   for reason in dict.fromkeys(intel))
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     return {
         "meta": {
             "scanned_path": str(pdf_path),
-            "version": PDFCHECKER_VERSION,
+            "version": __version__,
             "timestamp": timestamp,
             "operator": operator_name,
-            "vt_enabled": check_virustotal,
+            "vt_enabled": vt is not None,
+            "urlhaus_enabled": urlhaus is not None,
             "defang": defang,
             "include_logo": include_logo,
         },
-        "risk": analysis_result.risk,
+        "risk": risk,
         "hashes": analysis_result.hashes,
         "vt_file": vt_file,
+        "urlhaus_file": urlhaus_file,
         "links": links,
         "metadata": analysis_result.metadata,
         "javascript": analysis_result.javascript,
         "embedded": analysis_result.embedded,
         "structure": analysis_result.structure,
         "qr": qr,
-        "qr_unavailable_message": QR_UNAVAILABLE_MESSAGE,
         "errors": analysis_result.errors,
     }
 
 
-def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=None,
-                  validate_pdf_file=None, link_checker=None, include_logo=True):
+# `providers` are the reputation clients chosen for this operation; bulk mode
+# shares them across files so each call limit spans the whole batch.
+def create_report(pdf_path, defang=False, operator_name=None, providers=(),
+                  include_logo=True):
+    reserved_output = None
     try:
-        # Deferred import: xhtml2pdf pulls in reportlab and is slow to load,
-        # and only this function needs it
-        from xhtml2pdf import pisa
-
         if operator_name and len(operator_name) > MAX_OPERATOR_NAME_LENGTH:
             operator_name = operator_name[:MAX_OPERATOR_NAME_LENGTH-3] + "..."
 
@@ -258,94 +257,58 @@ def create_report(pdf_path, check_virustotal=False, defang=False, operator_name=
 
         counter = 1
         original_output_path = output_path
-        while output_path.exists():
-            output_path = original_output_path.parent / f"{safe_stem}_report_{counter}.pdf"
-            counter += 1
+        while True:
+            try:
+                fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+                reserved_output = output_path
+                break
+            except FileExistsError:
+                output_path = original_output_path.parent / f"{safe_stem}_report_{counter}.pdf"
+                counter += 1
 
-        analysis_result = analyze_pdf_once(pdf_path, validate_pdf_file)
-
-        # Share one extractor across the hash lookup, all links and QR URLs
-        # so the API call limit is enforced; bulk mode passes its own so
-        # the limit spans all files
-        if check_virustotal and link_checker is None:
-            link_checker = LinkExtractor()
-            link_checker._initialize_api_config()
+        analysis_result = analyze_pdf_once(pdf_path)
+        print_coverage(analysis_result.coverage)
 
         report_data = _collect_report_data(
-            pdf_path, analysis_result, check_virustotal, defang,
-            operator_name, link_checker, include_logo
-        )
+            pdf_path, analysis_result, defang, operator_name, providers, include_logo)
         report_html = build_report_html(report_data)
-
-        with open(output_path, 'wb') as output_file:
-            status = pisa.CreatePDF(report_html, dest=output_file)
-        if status.err:
-            output_path.unlink(missing_ok=True)
-            raise RuntimeError("HTML to PDF conversion failed")
+        _render_html_to_pdf(report_html, report_data['meta'], output_path)
 
         return str(output_path)
 
     except Exception as e:
+        if reserved_output is not None:
+            try:
+                reserved_output.unlink()
+            except OSError:
+                pass
         print(f"Error generating report: {str(e)}")
         return None
 
-# main function to generate the report
-def main(pdf_path, validate_pdf_file=None):
-    if validate_pdf_file and not validate_pdf_file(pdf_path):
-        return
-
+# Operator name for the report ('' to skip), or None when the user cancels
+def ask_operator_name():
     try:
-        operator_name = input("\nPlease type your name (enter to skip): ").strip()[:MAX_OPERATOR_NAME_LENGTH]
+        return input("\nPlease type your name (enter to skip): ").strip()[:MAX_OPERATOR_NAME_LENGTH]
     except (EOFError, KeyboardInterrupt):
         print("\nOperation cancelled.")
+        return None
+
+# main function to generate the report
+def main(pdf_path):
+    operator_name = ask_operator_name()
+    if operator_name is None:
         return
 
-    # get_api_key raises when no secure keyring backend is available
-    try:
-        success, api_key = get_api_key()
-    except ConfigError as e:
-        print(f"Warning: Could not access VirusTotal API key: {e}")
-        success, api_key = False, None
+    with selected_providers("elements", VirusTotalClient(), URLhausClient()) as providers:
+        defang = get_confirmation("\nWould you like to defang URLs?")
+        include_logo = get_confirmation("\nWould you like to include the logo in the report?")
 
-    check_vt = False
-    defang = False
-
-    if success and api_key:
-        check_vt = get_confirmation("\nWould you like to check elements with VirusTotal?")
-
-    defang = get_confirmation("\nWould you like to defang URLs?")
-
-    include_logo = get_confirmation("\nWould you like to include the logo in the report?")
-
-    print(f"\nGenerating report for {pdf_path}...")
-    report_path = create_report(pdf_path, check_vt, defang, operator_name,
-                                validate_pdf_file=validate_pdf_file, include_logo=include_logo)
+        print(f"\nGenerating report for {pdf_path}...")
+        report_path = create_report(pdf_path, defang, operator_name, providers, include_logo)
 
     if report_path:
         print(f"\nReport generated successfully: {report_path}")
-        hashes = calculate_file_hashes(report_path)
-        if 'SHA-256' in hashes:
-            print(f"\nSHA256 of the report: {hashes['SHA-256']}")
+        print(f"\nSHA256 of the report: {calculate_file_hashes(report_path)['SHA-256']}")
     else:
         print("\nFailed to generate report.")
-
-if __name__ == "__main__":
-    import sys
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Generate PDF analysis report')
-    parser.add_argument('-r', '--report', help='Path to the PDF file to analyze')
-    args = parser.parse_args()
-
-    if not args.report:
-        print("Error: Please provide a PDF file path using -r or --report")
-        print("Usage: python report_generator.py -r <pdf_file>")
-        sys.exit(1)
-
-    pdf_path = args.report
-
-    if not os.path.exists(pdf_path):
-        print(f"Error: File {pdf_path} does not exist")
-        sys.exit(1)
-
-    main(pdf_path)
